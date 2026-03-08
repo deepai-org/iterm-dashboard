@@ -5,6 +5,7 @@ import subprocess
 import json
 import re
 import os
+import time
 import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -42,17 +43,48 @@ class Session:
     cpu: float = 0.0
     is_claude: bool = False
     running_command: str = ""
+    # Foreground command inference
+    fg_command: str = ""
+    fg_args: str = ""
+    # Session role classification
+    role: str = "shell"  # shell|editor|agent|build|test|logs|remote|server
+    # Activity state
+    activity_state: str = "active"  # active|idle|stale|zombie
+    idle_secs: int = 0
+    # Remote/prod detection
+    remote_type: str = ""  # ssh|kubectl|docker|psql|mysql|mosh|et
+    remote_target: str = ""
+    is_production: bool = False
 
 
 @dataclass
 class GitStatus:
     branch: str = ""
     dirty: int = 0
+    staged: int = 0
+    modified: int = 0
+    untracked: int = 0
+    conflicts: int = 0
     stashes: int = 0
     ahead: int = 0
     behind: int = 0
     has_remote: bool = True
     is_git: bool = False
+    detached: bool = False
+    special_state: str = ""  # rebase|merge|cherry-pick|bisect
+    last_commit_age_secs: int = 0
+    worktree: bool = False
+
+
+@dataclass
+class RefreshSnapshot:
+    """Minimal snapshot for computing deltas between refreshes."""
+    session_ids: set = field(default_factory=set)
+    project_paths: set = field(default_factory=set)
+    project_branches: dict = field(default_factory=dict)  # path -> branch
+    project_dirty: dict = field(default_factory=dict)  # path -> dirty count
+    total_claude: int = 0
+    total_claude_mem_kb: int = 0
 
 
 # ── Subprocess helpers ────────────────────────────────────────────────────────
@@ -183,6 +215,91 @@ def get_iterm_sessions():
     return sessions
 
 
+SHELL_NAMES = {"bash", "zsh", "-bash", "-zsh", "fish", "-fish", "sh", "-sh"}
+SKIP_CMDS = {"login", "-bash", "-zsh", "bash", "zsh", "fish", "-fish", "sh", "-sh"}
+
+REMOTE_PATTERNS = [
+    (re.compile(r'^ssh\s+(.+)'), "ssh"),
+    (re.compile(r'^mosh\s+(.+)'), "mosh"),
+    (re.compile(r'^et\s+(.+)'), "et"),
+    (re.compile(r'^kubectl\s+.*exec\s+.*?(-it?\s+)?(\S+)'), "kubectl"),
+    (re.compile(r'^docker\s+exec\s+.*?(-it?\s+)?(\S+)'), "docker"),
+    (re.compile(r'^psql\b(.*)'), "psql"),
+    (re.compile(r'^mysql\b(.*)'), "mysql"),
+    (re.compile(r'^redis-cli\b(.*)'), "redis"),
+    (re.compile(r'^mongo\b(.*)'), "mongo"),
+]
+
+PROD_KEYWORDS = {"prod", "production", "prd", "live", "primary"}
+
+ROLE_PATTERNS = {
+    "editor": {"vim", "nvim", "vi", "nano", "emacs", "code", "hx", "helix", "micro"},
+    "agent": {"claude", "aider", "cursor", "copilot"},
+    "build": {"make", "cargo", "go", "gcc", "g++", "clang", "cmake", "swift", "swiftc",
+              "xcodebuild", "npm", "yarn", "pnpm", "bun", "webpack", "vite", "tsc", "rustc"},
+    "test": {"pytest", "jest", "mocha", "cargo-test", "go-test", "rspec", "phpunit",
+             "xctest", "swift-test"},
+    "logs": {"tail", "less", "more", "bat", "lnav", "stern"},
+    "server": {"node", "python", "ruby", "uvicorn", "gunicorn", "flask", "django",
+               "rails", "next", "hugo", "serve", "http-server", "live-server"},
+}
+
+
+def _deepest_foreground(shell_pid, procs):
+    """Walk the process tree from shell_pid to find the deepest foreground child."""
+    children = defaultdict(list)
+    pid_to_proc = {}
+    for p in procs:
+        pid_to_proc[p["pid"]] = p
+        children[p["ppid"]].append(p)
+
+    current = shell_pid
+    while True:
+        kids = children.get(current, [])
+        if not kids:
+            break
+        # Prefer the child with highest CPU, then most RSS (likely the interactive one)
+        kids.sort(key=lambda c: (-c["cpu"], -c["rss"]))
+        current = kids[0]["pid"]
+
+    proc = pid_to_proc.get(current)
+    if proc and current != shell_pid:
+        return proc
+    return None
+
+
+def _classify_role(cmd_base, full_cmd):
+    """Classify a command into a session role."""
+    for role, names in ROLE_PATTERNS.items():
+        if cmd_base in names:
+            # Distinguish cargo build vs cargo test
+            if cmd_base == "cargo" and "test" in full_cmd:
+                return "test"
+            if cmd_base == "go" and "test" in full_cmd:
+                return "test"
+            return role
+    return "shell"
+
+
+def _detect_remote(full_cmd):
+    """Detect remote session context from a command string. Returns (type, target, is_prod)."""
+    cmd_base = full_cmd.split()[0] if full_cmd else ""
+    for pattern, rtype in REMOTE_PATTERNS:
+        m = pattern.match(full_cmd)
+        if m:
+            target = m.group(m.lastindex) if m.lastindex else ""
+            target = target.strip().split()[-1] if target.strip() else ""
+            # Strip user@ from ssh targets
+            if "@" in target:
+                target = target.split("@")[-1]
+            # Remove flags
+            if target.startswith("-"):
+                target = ""
+            is_prod = any(kw in full_cmd.lower() for kw in PROD_KEYWORDS)
+            return rtype, target, is_prod
+    return "", "", False
+
+
 def enrich_sessions(sessions):
     tty_map = {}
     for s in sessions:
@@ -203,14 +320,20 @@ def enrich_sessions(sessions):
         })
 
     shell_pids = {}
+    now = time.time()
+
     for tty_name, sess in tty_map.items():
         procs = tty_procs.get(tty_name, [])
         sess.processes = procs
 
+        # Find shell process
+        shell_pid = None
         for p in procs:
-            if p["cmd"].startswith("-bash") or p["cmd"].startswith("-zsh") or p["cmd"] in ("bash", "zsh"):
+            base = p["cmd"].split()[0]
+            if base in SHELL_NAMES:
                 shell_pids[p["pid"]] = tty_name
                 sess.uptime = p["etime"]
+                shell_pid = p["pid"]
                 break
         else:
             for p in procs:
@@ -218,36 +341,76 @@ def enrich_sessions(sessions):
                     sess.uptime = p["etime"]
                     break
 
+        # Foreground command inference — walk to deepest child
+        if shell_pid:
+            fg_proc = _deepest_foreground(shell_pid, procs)
+            if fg_proc:
+                fg_full = fg_proc["cmd"]
+                fg_parts = fg_full.split()
+                fg_base = os.path.basename(fg_parts[0]) if fg_parts else ""
+                sess.fg_command = fg_base
+                sess.fg_args = " ".join(fg_parts[1:3]) if len(fg_parts) > 1 else ""
+                sess.running_command = fg_base
+
+                # Remote detection on the foreground command
+                rtype, rtarget, is_prod = _detect_remote(fg_full)
+                if rtype:
+                    sess.remote_type = rtype
+                    sess.remote_target = rtarget
+                    sess.is_production = is_prod
+                    sess.role = "remote"
+                else:
+                    sess.role = _classify_role(fg_base, fg_full)
+        elif not procs:
+            sess.activity_state = "zombie"
+
+        # Detect Claude instances
         for p in procs:
             if p["cmd"].startswith("claude"):
                 sess.is_claude = True
                 sess.mem_kb = p["rss"]
                 sess.cpu = p["cpu"]
+                sess.role = "agent"
                 break
 
+        # Detect LSP servers
         for p in procs:
             if "sourcekit-lsp" in p["cmd"]:
-                sess.running_command = "sourcekit-lsp"
+                if not sess.running_command:
+                    sess.running_command = "sourcekit-lsp"
                 break
 
-        if not sess.running_command:
-            for p in procs:
-                cmd = p["cmd"]
-                if any(skip in cmd for skip in ["login ", "-bash", "-zsh", "bash", "zsh"]):
-                    continue
-                if cmd.startswith("claude"):
-                    sess.running_command = "claude"
-                elif "clangd" in cmd:
-                    pass
-                elif "caffeinate" in cmd:
-                    sess.running_command = "caffeinate"
+        # TTY idle detection via device mtime
+        try:
+            tty_path = f"/dev/{tty_name}"
+            mtime = os.stat(tty_path).st_mtime
+            sess.idle_secs = int(now - mtime)
+        except OSError:
+            sess.idle_secs = 0
+
+        # Activity state classification
+        if sess.activity_state != "zombie":
+            has_fg = bool(sess.fg_command) and sess.fg_command not in SHELL_NAMES
+            if has_fg or sess.idle_secs < 60:
+                sess.activity_state = "active"
+            elif sess.idle_secs < 1800:
+                sess.activity_state = "idle"
+            else:
+                uptime_secs = parse_etime(sess.uptime) if sess.uptime else 0
+                # Zombie: only shell procs remain, idle >30m, uptime >1d
+                # Catches dead Claude sessions (task name in window title, process gone)
+                only_shell = not has_fg and not sess.is_claude
+                if only_shell and sess.idle_secs > 1800 and uptime_secs > 86400:
+                    sess.activity_state = "zombie"
+                elif uptime_secs > 5 * 86400 and sess.idle_secs > 43200:
+                    sess.activity_state = "zombie"
                 else:
-                    sess.running_command = cmd.split()[0] if cmd else ""
-                break
+                    sess.activity_state = "stale"
 
         sess.window_name = strip_iterm_prefix(sess.window_name)
         sess.session_name = strip_iterm_prefix(sess.session_name)
 
+    # Batch lsof for CWDs
     if shell_pids:
         pid_csv = ",".join(str(p) for p in shell_pids)
         lsof_out = run_args(["lsof", "-a", "-d", "cwd", "-p", pid_csv, "-Fpn"], timeout=10)
@@ -264,10 +427,11 @@ def enrich_sessions(sessions):
 
 
 def find_git_root(path):
-    """Walk up from path to find the nearest .git directory."""
+    """Walk up from path to find the nearest .git directory or file (worktree)."""
     current = path
     while True:
-        if os.path.isdir(os.path.join(current, ".git")):
+        dot_git = os.path.join(current, ".git")
+        if os.path.isdir(dot_git) or os.path.isfile(dot_git):
             return current
         parent = os.path.dirname(current)
         if parent == current:
@@ -283,18 +447,44 @@ def get_git_status(path):
     gs.is_git = True
     path = git_root
 
+    # Check if this is a worktree (has .git file instead of .git directory)
+    dot_git = os.path.join(path, ".git")
+    if os.path.isfile(dot_git):
+        gs.worktree = True
+
     output = run_args(["git", "-C", path, "status", "--porcelain=v2", "--branch"])
     for line in output.splitlines():
         if line.startswith("# branch.head "):
-            gs.branch = line[len("# branch.head "):] or "HEAD"
+            head = line[len("# branch.head "):]
+            if head == "(detached)":
+                gs.detached = True
+                # Get short SHA for detached HEAD
+                sha = run_args(["git", "-C", path, "rev-parse", "--short", "HEAD"])
+                gs.branch = sha or "HEAD"
+            else:
+                gs.branch = head or "HEAD"
         elif line.startswith("# branch.ab "):
             match = re.match(r'# branch\.ab \+(\d+) -(\d+)', line)
             if match:
                 gs.ahead = int(match.group(1))
                 gs.behind = int(match.group(2))
                 gs.has_remote = True
-        elif not line.startswith("#"):
+        elif line.startswith("u "):
+            # Unmerged entry — conflict
+            gs.conflicts += 1
             gs.dirty += 1
+        elif line.startswith("? "):
+            gs.untracked += 1
+            gs.dirty += 1
+        elif line.startswith("1 ") or line.startswith("2 "):
+            # Ordinary or rename/copy entry: "1 XY ..." or "2 XY ..."
+            gs.dirty += 1
+            xy = line.split()[1] if len(line.split()) > 1 else ".."
+            x, y = (xy[0], xy[1]) if len(xy) >= 2 else (".", ".")
+            if x != ".":
+                gs.staged += 1
+            if y != ".":
+                gs.modified += 1
 
     if gs.ahead == 0 and gs.behind == 0:
         has_ab = any(l.startswith("# branch.ab ") for l in output.splitlines())
@@ -303,6 +493,36 @@ def get_git_status(path):
 
     if not gs.branch:
         gs.branch = "HEAD"
+
+    # Detect special git states via sentinel files
+    git_dir = path + "/.git"
+    if gs.worktree:
+        # Read the gitdir path from the .git file
+        try:
+            with open(dot_git) as f:
+                content = f.read().strip()
+                if content.startswith("gitdir: "):
+                    git_dir = content[8:]
+        except OSError:
+            pass
+
+    if os.path.isdir(os.path.join(git_dir, "rebase-merge")) or os.path.isdir(os.path.join(git_dir, "rebase-apply")):
+        gs.special_state = "REBASE"
+    elif os.path.isfile(os.path.join(git_dir, "MERGE_HEAD")):
+        gs.special_state = "MERGE"
+    elif os.path.isfile(os.path.join(git_dir, "CHERRY_PICK_HEAD")):
+        gs.special_state = "CHERRY-PICK"
+    elif os.path.isfile(os.path.join(git_dir, "BISECT_LOG")):
+        gs.special_state = "BISECT"
+
+    # Last commit age
+    ts = run_args(["git", "-C", path, "log", "-1", "--format=%ct"])
+    if ts and ts.isdigit():
+        gs.last_commit_age_secs = int(time.time()) - int(ts)
+
+    # Stash count
+    stash_out = run_args(["git", "-C", path, "stash", "list", "--oneline"])
+    gs.stashes = len(stash_out.splitlines()) if stash_out else 0
 
     return gs
 
@@ -376,14 +596,57 @@ def format_uptime(etime):
     return f"{mins}m"
 
 
+def format_age(secs):
+    """Format seconds into a short age string like '2h' or '3d'."""
+    if secs <= 0:
+        return ""
+    days = secs // 86400
+    hours = (secs % 86400) // 3600
+    mins = (secs % 3600) // 60
+    if days > 0:
+        return f"{days}d"
+    if hours > 0:
+        return f"{hours}h"
+    return f"{mins}m"
+
+
 def git_badge(gs):
     if not gs.is_git:
         return "[no git]"
-    parts = [gs.branch]
+
+    parts = []
+
+    # Special state prefix
+    if gs.special_state:
+        parts.append(gs.special_state)
+        parts.append("|")
+
+    # Branch (with detached indicator)
+    if gs.detached:
+        parts.append(f"@{gs.branch}")
+    else:
+        parts.append(gs.branch)
+
+    # Worktree indicator
+    if gs.worktree:
+        parts.append("(wt)")
+
+    # File status breakdown
     if gs.dirty:
-        parts.append(f"*{gs.dirty}")
+        status_parts = []
+        if gs.staged:
+            status_parts.append(f"S{gs.staged}")
+        if gs.modified:
+            status_parts.append(f"M{gs.modified}")
+        if gs.untracked:
+            status_parts.append(f"?{gs.untracked}")
+        if gs.conflicts:
+            status_parts.append(f"!{gs.conflicts}")
+        parts.append(" ".join(status_parts) if status_parts else f"*{gs.dirty}")
     else:
         parts.append("\u2713")
+
+    # Remote tracking
     if gs.has_remote:
         if gs.ahead:
             parts.append(f"\u2191{gs.ahead}")
@@ -393,6 +656,11 @@ def git_badge(gs):
             parts.append("=")
     else:
         parts.append("\u2298")
+
+    # Last commit age (only if > 1 day)
+    if gs.last_commit_age_secs > 86400:
+        parts.append(f"({format_age(gs.last_commit_age_secs)} ago)")
+
     return "[" + " ".join(parts) + "]"
 
 
@@ -500,18 +768,48 @@ def make_item(attr_string, indent=0, action=None, target=None, tag=0, image=None
 
 # ── Session line builder ──────────────────────────────────────────────────────
 
+ROLE_ICONS = {
+    "editor": "pencil",
+    "agent": "cpu.fill",
+    "build": "hammer.fill",
+    "test": "checkmark.circle.fill",
+    "logs": "doc.text.fill",
+    "remote": "globe",
+    "server": "server.rack",
+    "shell": "apple.terminal.fill",
+}
+
+ACTIVITY_COLORS = {
+    "active": None,  # use default
+    "idle": "CLR_ORANGE",
+    "stale": "CLR_DIM",
+    "zombie": "CLR_RED",
+}
+
+
 def build_session_segments(s, is_last):
     """Build rich text segments for a session line."""
     connector = "\u2514\u2500" if is_last else "\u251C\u2500"
     tty_short = s.tty.replace("/dev/", "")
-    name = s.window_name
+
+    # Build display name: prefer foreground command for non-claude sessions
+    if s.is_claude:
+        name = s.window_name
+    elif s.fg_command and s.fg_command not in SHELL_NAMES:
+        # Show the foreground command with args
+        name = s.fg_command
+        if s.fg_args:
+            name += " " + s.fg_args
+    else:
+        name = s.window_name
+
     if len(name) > NAME_WIDTH:
         name = name[:NAME_WIDTH - 1] + "\u2026"
     padded_name = name.ljust(NAME_WIDTH)
     uptime = format_uptime(s.uptime) if s.uptime else ""
     uptime_secs = parse_etime(s.uptime) if s.uptime else 0
 
-    # Uptime color: green < 1d, cyan < 3d, orange < 5d, red >= 5d
+    # Uptime color
     if uptime_secs >= 5 * 86400:
         uptime_clr = CLR_RED
     elif uptime_secs >= 3 * 86400:
@@ -521,13 +819,40 @@ def build_session_segments(s, is_last):
     else:
         uptime_clr = CLR_GREEN
 
-    # Name color: purple for claude, secondary for shells
-    name_clr = CLR_PURPLE if s.is_claude else CLR_SECONDARY
+    # Name color based on role and activity
+    if s.is_claude:
+        name_clr = CLR_PURPLE
+    elif s.is_production:
+        name_clr = CLR_RED
+    elif s.remote_type:
+        name_clr = CLR_CYAN
+    elif s.activity_state == "zombie":
+        name_clr = CLR_RED
+    elif s.activity_state == "stale":
+        name_clr = CLR_DIM
+    else:
+        name_clr = CLR_SECONDARY
 
     segments = [
         (f" {connector} ", MONO_SM, CLR_DIM),
         (padded_name, BOLD_SM if s.is_claude else MONO_SM, name_clr),
     ]
+
+    # Tags section (role, remote, activity)
+    tags = []
+    if s.remote_type:
+        tag = s.remote_type
+        if s.remote_target:
+            tag += f":{s.remote_target}"
+        tags.append(tag)
+    if s.is_production:
+        tags.append("PROD")
+    if s.activity_state in ("idle", "stale", "zombie"):
+        if s.activity_state == "idle":
+            idle_str = format_age(s.idle_secs)
+            tags.append(f"idle {idle_str}")
+        else:
+            tags.append(s.activity_state)
 
     if s.is_claude:
         mem_str = format_bytes(s.mem_kb).rjust(5)
@@ -542,14 +867,27 @@ def build_session_segments(s, is_last):
             (mem_str, MONO_SM, mem_clr),
             (" ", MONO_SM, None),
             (cpu_str, MONO_SM, cpu_clr if s.cpu >= 1.0 else CLR_DIM),
+        ]
+        if tags:
+            segments.append((" ", MONO_SM, CLR_DIM))
+            segments.append((" ".join(tags), MONO_SM, CLR_ORANGE))
+        segments += [
             (" \u2502 ", MONO_SM, CLR_DIM),
             (tty_short, MONO_SM, CLR_DIM),
             (" \u2502 ", MONO_SM, CLR_DIM),
             (uptime, MONO_SM, uptime_clr),
         ]
     else:
+        if tags:
+            tag_str = " ".join(tags)
+            pad = max(1, 12 - len(tag_str))
+            segments.append((" " * pad, MONO_SM, CLR_DIM))
+            tag_clr = CLR_RED if s.is_production else CLR_ORANGE if "zombie" in tags or "stale" in tags else CLR_CYAN
+            segments.append((tag_str, MONO_SM, tag_clr))
+            segments.append((" \u2502 ", MONO_SM, CLR_DIM))
+        else:
+            segments.append(("            \u2502 ", MONO_SM, CLR_DIM))
         segments += [
-            ("            \u2502 ", MONO_SM, CLR_DIM),
             (tty_short, MONO_SM, CLR_DIM),
             (" \u2502 ", MONO_SM, CLR_DIM),
             (uptime, MONO_SM, uptime_clr),
@@ -558,15 +896,24 @@ def build_session_segments(s, is_last):
     return segments
 
 
-def build_project_header_segments(proj_name, gs, warning):
+def build_project_header_segments(proj_name, gs, warning, role_summary=""):
     """Build rich text segments for a project header."""
     badge = git_badge(gs)
     segments = [
         (f"{proj_name}  ", BOLD, CLR_ACCENT),
     ]
-    # Color the badge based on status
-    if not gs.is_git:
+
+    # Special state gets its own prominent color
+    if gs.special_state:
+        # Split badge to color special state differently
+        segments.append((gs.special_state, BOLD_SM, CLR_RED))
+        rest = badge[len(gs.special_state):]
+        badge_clr = CLR_RED if gs.conflicts else CLR_ORANGE if gs.dirty > 0 else CLR_GREEN
+        segments.append((rest, MONO_SM, badge_clr))
+    elif not gs.is_git:
         segments.append((badge, MONO_SM, CLR_DIM))
+    elif gs.conflicts:
+        segments.append((badge, MONO_SM, CLR_RED))
     elif gs.dirty > 20:
         segments.append((badge, MONO_SM, CLR_RED))
     elif gs.dirty > 0:
@@ -576,6 +923,11 @@ def build_project_header_segments(proj_name, gs, warning):
 
     if warning:
         segments.append((f" {warning}", MONO_SM, CLR_RED))
+
+    # Compact role summary
+    if role_summary:
+        segments.append(("  ", MONO_SM, CLR_DIM))
+        segments.append((role_summary, MONO_SM, CLR_DIM))
 
     return segments
 
@@ -597,26 +949,108 @@ def build_insight_segments(text):
 
 # ── Data Collection ───────────────────────────────────────────────────────────
 
-def collect_menu_data():
-    """Collect all data. Returns (data, session_map, project_window_map)."""
+def _build_role_summary(sess_list):
+    """Build a compact role summary like '2 agent, 1 editor, 1 shell'."""
+    from collections import Counter
+    roles = Counter(s.role for s in sess_list)
+    parts = []
+    for role in ["agent", "editor", "build", "test", "server", "remote", "logs", "shell"]:
+        count = roles.get(role, 0)
+        if count > 0:
+            parts.append(f"{count} {role}")
+    return ", ".join(parts)
+
+
+def _compute_snapshot(sessions, sorted_projects, git_statuses, total_claude, total_claude_mem):
+    """Build a RefreshSnapshot from current data."""
+    snap = RefreshSnapshot()
+    snap.session_ids = {s.session_id for s in sessions}
+    snap.project_paths = {path for path, _ in sorted_projects}
+    snap.project_branches = {path: git_statuses[path].branch for path, _ in sorted_projects if path in git_statuses}
+    snap.project_dirty = {path: git_statuses[path].dirty for path, _ in sorted_projects if path in git_statuses}
+    snap.total_claude = total_claude
+    snap.total_claude_mem_kb = total_claude_mem
+    return snap
+
+
+def _compute_deltas(prev, curr, sorted_projects, git_statuses):
+    """Compute change descriptions between two snapshots."""
+    if prev is None:
+        return []
+
+    deltas = []
+
+    # New/closed sessions
+    new_sids = curr.session_ids - prev.session_ids
+    closed_sids = prev.session_ids - curr.session_ids
+    if new_sids:
+        deltas.append(f"[+] {len(new_sids)} new session{'s' if len(new_sids) > 1 else ''} opened")
+    if closed_sids:
+        deltas.append(f"[-] {len(closed_sids)} session{'s' if len(closed_sids) > 1 else ''} closed")
+
+    # New/closed projects
+    new_projs = curr.project_paths - prev.project_paths
+    closed_projs = prev.project_paths - curr.project_paths
+    for p in new_projs:
+        deltas.append(f"[+] New project: {os.path.basename(p)}")
+    for p in closed_projs:
+        deltas.append(f"[-] Project closed: {os.path.basename(p)}")
+
+    # Branch changes
+    for path, _ in sorted_projects:
+        pname = os.path.basename(path)
+        old_branch = prev.project_branches.get(path)
+        new_branch = curr.project_branches.get(path)
+        if old_branch and new_branch and old_branch != new_branch:
+            deltas.append(f"[~] {pname}: branch {old_branch} \u2192 {new_branch}")
+
+        old_dirty = prev.project_dirty.get(path, 0)
+        new_dirty = curr.project_dirty.get(path, 0)
+        if old_dirty == 0 and new_dirty > 0:
+            deltas.append(f"[~] {pname}: went dirty ({new_dirty} files)")
+        elif old_dirty > 0 and new_dirty == 0:
+            deltas.append(f"[~] {pname}: now clean")
+
+    # Claude count changes
+    claude_diff = curr.total_claude - prev.total_claude
+    if claude_diff > 0:
+        deltas.append(f"[+] {claude_diff} new Claude instance{'s' if claude_diff > 1 else ''}")
+    elif claude_diff < 0:
+        deltas.append(f"[-] {-claude_diff} Claude instance{'s' if -claude_diff > 1 else ''} closed")
+
+    # Memory changes
+    mem_diff_mb = (curr.total_claude_mem_kb - prev.total_claude_mem_kb) / 1024
+    if abs(mem_diff_mb) >= 100:
+        sign = "+" if mem_diff_mb > 0 else ""
+        deltas.append(f"[~] Claude RAM {sign}{mem_diff_mb:.0f}M")
+
+    return deltas
+
+
+def collect_menu_data(prev_snapshot=None):
+    """Collect all data. Returns (data, session_map, project_window_map, snapshot)."""
     sessions = get_iterm_sessions()
     if not sessions:
-        return None, {}, {}
+        return None, {}, {}, None
 
     enrich_sessions(sessions)
 
     home = os.path.expanduser("~")
-    projects = defaultdict(list)
+    projects = defaultdict(list)  # keyed by git_root or cwd
     unassigned = []
+    git_root_cache = {}  # cwd -> git_root or None
 
     for s in sessions:
         if not s.cwd or s.cwd == home:
             unassigned.append(s)
         else:
-            projects[s.cwd].append(s)
+            cwd = s.cwd
+            if cwd not in git_root_cache:
+                git_root_cache[cwd] = find_git_root(cwd)
+            root = git_root_cache[cwd] or cwd
+            projects[root].append(s)
 
     def oldest_session_age(sess_list):
-        """Return the age in seconds of the oldest session in the list."""
         max_age = 0
         for s in sess_list:
             if s.uptime:
@@ -625,7 +1059,6 @@ def collect_menu_data():
                     max_age = age
         return max_age
 
-    # Sort projects: oldest session first (most established workspaces at top)
     sorted_projects = sorted(projects.items(), key=lambda x: -oldest_session_age(x[1]))
 
     git_statuses = {}
@@ -636,6 +1069,10 @@ def collect_menu_data():
     total_claude_mem = 0
     total_lsp = 0
     old_claude = []
+    stale_sessions = []
+    zombie_sessions = []
+    remote_sessions = []
+    prod_sessions = []
 
     for s in sessions:
         if s.is_claude:
@@ -645,11 +1082,24 @@ def collect_menu_data():
                 old_claude.append(s)
         if s.running_command == "sourcekit-lsp":
             total_lsp += 1
+        if s.activity_state == "stale":
+            stale_sessions.append(s)
+        if s.activity_state == "zombie":
+            zombie_sessions.append(s)
+        if s.remote_type:
+            remote_sessions.append(s)
+        if s.is_production:
+            prod_sessions.append(s)
+
+    # Build snapshot and compute deltas
+    snapshot = _compute_snapshot(sessions, sorted_projects, git_statuses, total_claude, total_claude_mem)
+    deltas = _compute_deltas(prev_snapshot, snapshot, sorted_projects, git_statuses)
 
     data = {
         "projects": [],
         "unassigned": [],
         "insights": [],
+        "deltas": deltas,
         "summary_segments": [],
     }
 
@@ -661,63 +1111,147 @@ def collect_menu_data():
         gs = git_statuses[proj_path]
         proj_name = os.path.basename(proj_path)
         warning = "\u26A0\uFE0F" if gs.dirty > 20 else ""
+        if gs.conflicts:
+            warning = "\u26A0\uFE0F CONFLICTS"
+
+        role_summary = _build_role_summary(sess_list)
 
         proj_tag = tag_counter
         tag_counter += 1
         proj_window_ids = [s.window_id for s in sess_list]
         project_window_map[proj_tag] = proj_window_ids
 
-        claude_sessions = []
-        named_sessions = []
-        shell_sessions = []
-
+        # Group sessions by sub-project (relative path within the git root)
+        subdir_groups = defaultdict(list)
         for s in sess_list:
-            sname_lower = s.window_name.lower()
-            if s.is_claude:
-                claude_sessions.append(s)
-            elif re.match(r'^default\s*\(', sname_lower) or sname_lower.startswith("(-bash") or sname_lower.startswith("(-zsh"):
-                shell_sessions.append(s)
+            if s.cwd and s.cwd != proj_path:
+                rel = os.path.relpath(s.cwd, proj_path)
+                # Only use the first path component as the sub-project name
+                subdir_name = rel.split(os.sep)[0]
             else:
-                named_sessions.append(s)
+                subdir_name = "."
+            subdir_groups[subdir_name].append(s)
 
-        # Within each group, sort by newest first (smallest uptime = most recent)
-        def session_age(s):
-            return parse_etime(s.uptime) if s.uptime else 0
-        claude_sessions.sort(key=session_age)
-        named_sessions.sort(key=session_age)
-        shell_sessions.sort(key=session_age)
-        all_display = claude_sessions + named_sessions + shell_sessions
+        has_subdirs = len(subdir_groups) > 1 or (len(subdir_groups) == 1 and "." not in subdir_groups)
+
+        # Sort subdirs: "." first, then alphabetically
+        sorted_subdirs = sorted(subdir_groups.keys(), key=lambda k: ("" if k == "." else k))
+
+        def _sort_sessions(sess_group):
+            claude_s = []
+            named_s = []
+            shell_s = []
+            for s in sess_group:
+                sname_lower = s.window_name.lower()
+                if s.is_claude:
+                    claude_s.append(s)
+                elif re.match(r'^default\s*\(', sname_lower) or sname_lower.startswith("(-bash") or sname_lower.startswith("(-zsh"):
+                    shell_s.append(s)
+                else:
+                    named_s.append(s)
+            def session_age(s):
+                return parse_etime(s.uptime) if s.uptime else 0
+            claude_s.sort(key=session_age)
+            named_s.sort(key=session_age)
+            shell_s.sort(key=session_age)
+            return claude_s + named_s + shell_s
+
+        all_display = []
+        subheader_positions = {}  # index -> subdir_name
+        in_subgroup_indices = set()  # indices of sessions under a subheader
+
+        for subdir_name in sorted_subdirs:
+            group = subdir_groups[subdir_name]
+            sorted_group = _sort_sessions(group)
+            start_idx = len(all_display)
+            if has_subdirs and subdir_name != ".":
+                sub_tag = tag_counter
+                tag_counter += 1
+                sub_window_ids = list(set(s.window_id for s in sorted_group))
+                project_window_map[sub_tag] = sub_window_ids
+                subheader_positions[start_idx] = (subdir_name, sub_tag)
+                for j in range(len(sorted_group)):
+                    in_subgroup_indices.add(start_idx + j)
+            elif has_subdirs and subdir_name == ".":
+                sub_tag = tag_counter
+                tag_counter += 1
+                sub_window_ids = list(set(s.window_id for s in sorted_group))
+                project_window_map[sub_tag] = sub_window_ids
+                subheader_positions[start_idx] = (proj_name + "/", sub_tag)
+                for j in range(len(sorted_group)):
+                    in_subgroup_indices.add(start_idx + j)
+            all_display.extend(sorted_group)
+
+        claude_count = sum(1 for s in all_display if s.is_claude)
 
         session_entries = []
         for i, s in enumerate(all_display):
+            # Insert sub-header if needed
+            if i in subheader_positions:
+                sh_name, sh_tag = subheader_positions[i]
+                session_entries.append({
+                    "type": "subheader",
+                    "name": sh_name,
+                    "tag": sh_tag,
+                })
+
             is_last = (i == len(all_display) - 1)
-            segments = build_session_segments(s, is_last)
+            # Check if this is the last session in its subdir group
+            next_is_subheader = (i + 1) in subheader_positions
+            is_last_in_group = is_last or next_is_subheader
+            segments = build_session_segments(s, is_last_in_group)
             s_tag = tag_counter
             tag_counter += 1
             session_map[s_tag] = s.window_id
-            # Build tooltip
+
+            # Build rich tooltip
             proc_names = [p["cmd"].split()[0] for p in s.processes
                           if not any(skip in p["cmd"] for skip in ["login", "-bash", "-zsh"])]
             tooltip = f"Path: {s.cwd}\nProfile: {s.profile}\nSize: {s.columns}x{s.rows}"
+            tooltip += f"\nRole: {s.role}"
+            tooltip += f"\nState: {s.activity_state}"
+            if s.fg_command:
+                tooltip += f"\nForeground: {s.fg_command} {s.fg_args}"
+            if s.remote_type:
+                tooltip += f"\nRemote: {s.remote_type} {s.remote_target}"
+            if s.idle_secs > 60:
+                tooltip += f"\nIdle: {format_age(s.idle_secs)}"
             if proc_names:
                 tooltip += f"\nProcesses: {', '.join(proc_names[:5])}"
             if s.is_claude:
                 tooltip += f"\nMemory: {format_bytes(s.mem_kb)}  CPU: {s.cpu}%"
 
+            # Choose icon based on role
+            icon_name = ROLE_ICONS.get(s.role, "apple.terminal.fill")
+            if s.is_claude:
+                icon_color = CLR_PURPLE
+            elif s.is_production:
+                icon_color = CLR_RED
+            elif s.remote_type:
+                icon_color = CLR_CYAN
+            elif s.activity_state in ("stale", "zombie"):
+                icon_color = CLR_DIM
+            else:
+                icon_color = CLR_SECONDARY
+
             session_entries.append({
+                "type": "session",
                 "segments": segments,
                 "tag": s_tag,
                 "is_claude": s.is_claude,
                 "tooltip": tooltip,
+                "icon_name": icon_name,
+                "icon_color": icon_color,
+                "in_subgroup": i in in_subgroup_indices,
             })
 
         data["projects"].append({
-            "header_segments": build_project_header_segments(proj_name, gs, warning),
+            "header_segments": build_project_header_segments(proj_name, gs, warning, role_summary),
             "tag": proj_tag,
             "sessions": session_entries,
             "path": proj_path,
             "session_count": len(all_display),
-            "claude_count": len(claude_sessions),
+            "claude_count": claude_count,
         })
 
     for i, s in enumerate(unassigned):
@@ -727,48 +1261,99 @@ def collect_menu_data():
         tag_counter += 1
         session_map[s_tag] = s.window_id
         tooltip = f"Path: {s.cwd or '~'}\nProfile: {s.profile}\nSize: {s.columns}x{s.rows}"
+        tooltip += f"\nRole: {s.role}\nState: {s.activity_state}"
+        if s.fg_command:
+            tooltip += f"\nForeground: {s.fg_command} {s.fg_args}"
+
+        icon_name = ROLE_ICONS.get(s.role, "apple.terminal.fill")
+        icon_color = CLR_PURPLE if s.is_claude else CLR_SECONDARY
+
         data["unassigned"].append({
             "segments": segments,
             "tag": s_tag,
             "is_claude": s.is_claude,
             "tooltip": tooltip,
+            "icon_name": icon_name,
+            "icon_color": icon_color,
         })
 
+    # ── System Insights ──
     total_mem_str = format_bytes(total_claude_mem)
     data["insights"].append(f"[!] {total_claude} Claude instances (~{total_mem_str} RAM)")
 
+    # Git-related insights
     for proj_path, sess_list in sorted_projects:
         gs = git_statuses[proj_path]
         proj_name = os.path.basename(proj_path)
+
+        if gs.special_state:
+            data["insights"].append(f"[!] {proj_name}: {gs.special_state} in progress")
+        if gs.conflicts:
+            data["insights"].append(f"[!] {proj_name}: {gs.conflicts} merge conflicts")
+        if gs.detached:
+            data["insights"].append(f"[!] {proj_name}: detached HEAD")
+
         for s in sess_list:
             if s.mem_kb > 500 * 1024:
                 data["insights"].append(f"[!] {proj_name}: {format_bytes(s.mem_kb)} ({s.window_name})")
         if gs.dirty > 15:
-            data["insights"].append(f"[!] {proj_name}: {gs.dirty} dirty files")
+            data["insights"].append(f"[!] {proj_name}: {gs.dirty} dirty files ({gs.untracked} untracked)")
         if gs.ahead > 3:
-            data["insights"].append(f"[!] {proj_name}: {gs.ahead} commits ahead")
+            data["insights"].append(f"[!] {proj_name}: {gs.ahead} unpushed commits")
+        if gs.stashes:
+            data["insights"].append(f"[i] {proj_name}: {gs.stashes} stash{'es' if gs.stashes > 1 else ''}")
 
+    # Session health insights
+    if prod_sessions:
+        hosts = [s.remote_target or s.remote_type for s in prod_sessions]
+        data["insights"].append(f"[!] {len(prod_sessions)} production session{'s' if len(prod_sessions) > 1 else ''}: {', '.join(hosts)}")
+    if remote_sessions:
+        data["insights"].append(f"[i] {len(remote_sessions)} remote session{'s' if len(remote_sessions) > 1 else ''} open")
+    if stale_sessions:
+        data["insights"].append(f"[i] {len(stale_sessions)} stale session{'s' if len(stale_sessions) > 1 else ''} (>30m idle)")
+    if zombie_sessions:
+        data["insights"].append(f"[!] {len(zombie_sessions)} zombie session{'s' if len(zombie_sessions) > 1 else ''}")
     if total_lsp:
         data["insights"].append(f"[i] {total_lsp} Swift LSP servers active")
     if old_claude:
         data["insights"].append(f"[i] {len(old_claude)} Claude instances >5d old")
 
-    shell_count = sum(1 for s in sessions if not s.is_claude and re.match(r'(?i)^default\s*\(', s.window_name))
+    # Detect repos with multiple sub-project dirs open
+    for proj_path, sess_list in sorted_projects:
+        subdirs = set()
+        for s in sess_list:
+            if s.cwd and s.cwd != proj_path:
+                rel = os.path.relpath(s.cwd, proj_path).split(os.sep)[0]
+                subdirs.add(rel)
+        if len(subdirs) > 1:
+            data["insights"].append(f"[i] {os.path.basename(proj_path)}: {len(subdirs)} sub-projects active")
+
+    shell_count = sum(1 for s in sessions if s.role == "shell")
+    remote_count = len(remote_sessions)
     data["summary_segments"] = [
         (f"{len(sessions)}", BOLD_SM, CLR_ACCENT),
         (" win ", MONO_SM, CLR_DIM),
         ("\u2502", MONO_SM, CLR_DIM),
         (f" {total_claude}", BOLD_SM, CLR_PURPLE),
-        (" claude ", MONO_SM, CLR_DIM),
+        (" agent ", MONO_SM, CLR_DIM),
         ("\u2502", MONO_SM, CLR_DIM),
         (f" {shell_count}", BOLD_SM, CLR_SECONDARY),
         (" shell ", MONO_SM, CLR_DIM),
-        ("\u2502", MONO_SM, CLR_DIM),
-        (f" {total_lsp}", BOLD_SM, CLR_CYAN),
-        (" LSP", MONO_SM, CLR_DIM),
     ]
+    if remote_count:
+        data["summary_segments"] += [
+            ("\u2502", MONO_SM, CLR_DIM),
+            (f" {remote_count}", BOLD_SM, CLR_CYAN),
+            (" remote ", MONO_SM, CLR_DIM),
+        ]
+    if total_lsp:
+        data["summary_segments"] += [
+            ("\u2502", MONO_SM, CLR_DIM),
+            (f" {total_lsp}", BOLD_SM, CLR_CYAN),
+            (" LSP", MONO_SM, CLR_DIM),
+        ]
 
-    return data, session_map, project_window_map
+    return data, session_map, project_window_map, snapshot
 
 
 # ── App Delegate ──────────────────────────────────────────────────────────────
@@ -778,6 +1363,7 @@ class AppDelegate(NSObject):
     _cached_data = objc.ivar()
     _session_map = objc.ivar()
     _project_window_map = objc.ivar()
+    _prev_snapshot = objc.ivar()
     _lock = objc.ivar()
     _refresh_timer = objc.ivar()
 
@@ -787,15 +1373,15 @@ class AppDelegate(NSObject):
         self._cached_data = None
         self._session_map = {}
         self._project_window_map = {}
+        self._prev_snapshot = None
         self._lock = threading.Lock()
 
         status_bar = NSStatusBar.systemStatusBar()
         self._status_item = status_bar.statusItemWithLength_(NSVariableStatusItemLength)
 
-        # Use SF Symbol for the status bar icon
         bar_icon = sf_symbol("terminal.fill", size=14.0)
         if bar_icon:
-            bar_icon.setTemplate_(True)  # adapts to light/dark menu bar
+            bar_icon.setTemplate_(True)
             self._status_item.button().setImage_(bar_icon)
         else:
             self._status_item.setTitle_(">_")
@@ -818,11 +1404,15 @@ class AppDelegate(NSObject):
         thread.start()
 
     def _bg_refresh(self):
-        data, session_map, project_window_map = collect_menu_data()
+        with self._lock:
+            prev = self._prev_snapshot
+        data, session_map, project_window_map, snapshot = collect_menu_data(prev_snapshot=prev)
         with self._lock:
             self._cached_data = data
             self._session_map = session_map
             self._project_window_map = project_window_map
+            if snapshot is not None:
+                self._prev_snapshot = snapshot
         self.performSelectorOnMainThread_withObject_waitUntilDone_("_updateMenu", None, False)
 
     def _updateMenu(self):
@@ -849,7 +1439,6 @@ class AppDelegate(NSObject):
         menu.addItem_(NSMenuItem.separatorItem())
 
         for proj in data["projects"]:
-            # Project header with folder icon
             proj_text = rich_text(proj["header_segments"])
             folder_icon = sf_symbol("folder.fill", color=CLR_ACCENT, size=12.0)
             item = make_item(
@@ -861,15 +1450,30 @@ class AppDelegate(NSObject):
             menu.addItem_(item)
 
             for sess in proj["sessions"]:
-                sess_text = rich_text(sess["segments"])
-                # SF Symbol per session type
-                if sess["is_claude"]:
-                    sess_icon = sf_symbol("cpu.fill", color=CLR_PURPLE, size=11.0)
-                else:
-                    sess_icon = sf_symbol("apple.terminal.fill", color=CLR_SECONDARY, size=11.0)
+                if sess.get("type") == "subheader":
+                    sub_text = rich_text([
+                        ("\u25B8 ", MONO_SM, CLR_DIM),
+                        (sess["name"] + "/", BOLD_SM, CLR_ACCENT),
+                    ])
+                    sub_icon = sf_symbol("folder", color=CLR_DIM, size=10.0)
+                    sub_item = make_item(
+                        sub_text, indent=1, image=sub_icon,
+                        action="projectClicked:", target=self,
+                        tag=sess["tag"],
+                    )
+                    sub_item.setEnabled_(True)
+                    menu.addItem_(sub_item)
+                    continue
 
+                indent = 2 if sess.get("in_subgroup") else 1
+                sess_text = rich_text(sess["segments"])
+                sess_icon = sf_symbol(
+                    sess.get("icon_name", "apple.terminal.fill"),
+                    color=sess.get("icon_color", CLR_SECONDARY),
+                    size=11.0,
+                )
                 item = make_item(
-                    sess_text, indent=1, action="sessionClicked:", target=self,
+                    sess_text, indent=indent, action="sessionClicked:", target=self,
                     tag=sess["tag"], image=sess_icon, tooltip=sess["tooltip"],
                 )
                 item.setEnabled_(True)
@@ -888,16 +1492,39 @@ class AppDelegate(NSObject):
 
             for sess in data["unassigned"]:
                 sess_text = rich_text(sess["segments"])
-                if sess["is_claude"]:
-                    sess_icon = sf_symbol("cpu.fill", color=CLR_PURPLE, size=11.0)
-                else:
-                    sess_icon = sf_symbol("apple.terminal.fill", color=CLR_SECONDARY, size=11.0)
+                sess_icon = sf_symbol(
+                    sess.get("icon_name", "apple.terminal.fill"),
+                    color=sess.get("icon_color", CLR_SECONDARY),
+                    size=11.0,
+                )
                 item = make_item(
                     sess_text, indent=1, action="sessionClicked:", target=self,
                     tag=sess["tag"], image=sess_icon, tooltip=sess["tooltip"],
                 )
                 item.setEnabled_(True)
                 menu.addItem_(item)
+
+            menu.addItem_(NSMenuItem.separatorItem())
+
+        # ── Changes Since Last Refresh ──
+        if data.get("deltas"):
+            changes_text = rich_text([("CHANGES", BOLD, CLR_LABEL)])
+            changes_icon = sf_symbol("arrow.triangle.2.circlepath", color=CLR_CYAN, size=12.0)
+            menu.addItem_(make_item(changes_text, image=changes_icon))
+
+            for line in data["deltas"]:
+                if line.startswith("[+]"):
+                    clr = CLR_GREEN
+                    ico = sf_symbol("plus.circle.fill", color=CLR_GREEN, size=10.0)
+                elif line.startswith("[-]"):
+                    clr = CLR_ORANGE
+                    ico = sf_symbol("minus.circle.fill", color=CLR_ORANGE, size=10.0)
+                else:
+                    clr = CLR_CYAN
+                    ico = sf_symbol("arrow.right.circle.fill", color=CLR_CYAN, size=10.0)
+                segments = [(line[:3], BOLD_SM, clr), (line[3:], MONO_SM, CLR_SECONDARY)]
+                line_text = rich_text(segments)
+                menu.addItem_(make_item(line_text, indent=1, image=ico))
 
             menu.addItem_(NSMenuItem.separatorItem())
 
@@ -909,7 +1536,6 @@ class AppDelegate(NSObject):
         for line in data["insights"]:
             segments = build_insight_segments(line)
             line_text = rich_text(segments)
-            # Icon based on severity
             if line.startswith("[!]"):
                 ico = sf_symbol("exclamationmark.triangle.fill", color=CLR_ORANGE, size=10.0)
             else:
