@@ -1,0 +1,76 @@
+# iTerm Dashboard
+
+A macOS menu bar app that shows all open iTerm2 windows grouped by project workspace.
+
+![screenshot](screenshot.png)
+
+## Features
+
+- **Project grouping** — sessions grouped by working directory with git status badges
+- **Claude instance tracking** — memory, CPU, and uptime for all running Claude Code instances
+- **Color-coded metrics** — memory (green/orange/red), uptime aging, CPU heat
+- **SF Symbols** — native macOS icons for folders, terminals, CPU, insights
+- **Click to focus** — click a session to raise that iTerm2 window, click a project header to raise all its windows
+- **Tooltips** — hover for full path, profile, terminal size, and process list
+- **Git status** — branch, dirty file count, ahead/behind, no-remote detection (walks up to find repo root)
+- **System insights** — warnings for high memory, dirty files, unpushed commits, stale instances
+- **Auto-refresh** — updates every 30 seconds, plus on menu open
+
+## Install
+
+No dependencies beyond the system Python 3 and PyObjC (ships with macOS).
+
+```bash
+open iTermDashboard.app
+```
+
+To launch on login, add `iTermDashboard.app` to System Settings > General > Login Items.
+
+## CLI Version
+
+A standalone terminal script that prints the same dashboard to stdout:
+
+```bash
+python3 iterm_dashboard.py
+```
+
+## Useful Commands
+
+```bash
+# Launch the menu bar app
+open iTermDashboard.app
+
+# Quit from terminal
+pkill -f itermdashboard
+
+# Relaunch (quit + open)
+pkill -f itermdashboard; sleep 1; open iTermDashboard.app
+
+# View the main script
+cat iTermDashboard.app/Contents/MacOS/itermdashboard
+
+# Check if it's running
+pgrep -f itermdashboard && echo "running" || echo "not running"
+
+# See its resource usage
+ps aux | grep itermdashboard | grep -v grep
+```
+
+## How It Works
+
+1. Queries iTerm2 via AppleScript for all windows/tabs/sessions
+2. Runs a single `ps` call to get process trees per TTY
+3. Runs a single batched `lsof` call to resolve CWDs for all shell PIDs
+4. Runs `git status --porcelain=v2 --branch` (one call per project) for git info
+5. Caches everything in a background thread; menu renders instantly from cache
+
+## Project Structure
+
+```
+iTermDashboard.app/
+  Contents/
+    Info.plist                  # App bundle config (LSUIElement for menu-bar-only)
+    MacOS/itermdashboard        # Main Python executable
+    Resources/AppIcon.icns      # Dock/Finder icon
+iterm_dashboard.py              # Standalone CLI version
+```
