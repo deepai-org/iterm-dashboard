@@ -1,0 +1,962 @@
+#!/usr/bin/env python3
+"""iTerm2 Workspace Dashboard — macOS menu bar app."""
+
+import subprocess
+import json
+import re
+import os
+import threading
+from collections import defaultdict
+from dataclasses import dataclass, field
+
+import objc
+from AppKit import (
+    NSApplication, NSObject, NSMenu, NSMenuItem, NSImage,
+    NSFont, NSAttributedString, NSMutableAttributedString,
+    NSStatusBar, NSVariableStatusItemLength,
+    NSApplicationActivationPolicyAccessory, NSColor,
+    NSFontAttributeName, NSForegroundColorAttributeName,
+    NSImageSymbolConfiguration,
+)
+from Foundation import NSDictionary, NSTimer
+
+
+# ── Data Classes ──────────────────────────────────────────────────────────────
+
+@dataclass
+class Session:
+    window_id: int
+    window_name: str
+    session_id: str
+    session_name: str
+    tty: str
+    profile: str
+    columns: int
+    rows: int
+    bounds: tuple
+    pid: int = 0
+    cwd: str = ""
+    processes: list = field(default_factory=list)
+    uptime: str = ""
+    mem_kb: int = 0
+    cpu: float = 0.0
+    is_claude: bool = False
+    running_command: str = ""
+
+
+@dataclass
+class GitStatus:
+    branch: str = ""
+    dirty: int = 0
+    stashes: int = 0
+    ahead: int = 0
+    behind: int = 0
+    has_remote: bool = True
+    is_git: bool = False
+
+
+# ── Subprocess helpers ────────────────────────────────────────────────────────
+
+def run_args(args, timeout=10):
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
+def run_osascript(script, timeout=15):
+    try:
+        r = subprocess.run(
+            ["osascript"],
+            input=script, capture_output=True, text=True, timeout=timeout,
+        )
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
+# ── Data Collection ───────────────────────────────────────────────────────────
+
+def strip_iterm_prefix(name):
+    return re.sub(r'^[\s\u2800-\u28FF\u2733\u2710\u2702]+\s*', '', name)
+
+
+def get_iterm_sessions():
+    script = '''
+    on escapeForJSON(theText)
+        set out to ""
+        repeat with c in characters of theText
+            set c to c as text
+            if c is "\\\\" then
+                set out to out & "\\\\\\\\"
+            else if c is "\\"" then
+                set out to out & "\\\\\\""
+            else if c is tab then
+                set out to out & "\\\\t"
+            else if c is return then
+                set out to out & "\\\\n"
+            else if c is (ASCII character 10) then
+                set out to out & "\\\\n"
+            else
+                set out to out & c
+            end if
+        end repeat
+        return out
+    end escapeForJSON
+
+    tell application "iTerm2"
+        set output to "["
+        set first_win to true
+        repeat with w in every window
+            if not first_win then set output to output & ","
+            set first_win to false
+            set wId to id of w
+            set wName to my escapeForJSON(name of w)
+            set wBounds to bounds of w
+            set output to output & "{\\"wid\\":" & wId
+            set output to output & ",\\"wname\\":\\"" & wName & "\\""
+            set output to output & ",\\"bounds\\":[" & item 1 of wBounds & "," & item 2 of wBounds & "," & item 3 of wBounds & "," & item 4 of wBounds & "]"
+            set output to output & ",\\"sessions\\":["
+            set first_sess to true
+            set tabCounter to 0
+            repeat with t in every tab of w
+                set tabCounter to tabCounter + 1
+                repeat with s in every session of t
+                    if not first_sess then set output to output & ","
+                    set first_sess to false
+                    try
+                        set sName to my escapeForJSON(name of s)
+                        set sTTY to tty of s
+                        set sProfile to my escapeForJSON(profile name of s)
+                        set sCols to columns of s
+                        set sRows to rows of s
+                        set sUID to unique ID of s
+                        set output to output & "{\\"sid\\":\\"" & sUID & "\\""
+                        set output to output & ",\\"sname\\":\\"" & sName & "\\""
+                        set output to output & ",\\"tty\\":\\"" & sTTY & "\\""
+                        set output to output & ",\\"profile\\":\\"" & sProfile & "\\""
+                        set output to output & ",\\"cols\\":" & sCols
+                        set output to output & ",\\"rows\\":" & sRows
+                        set output to output & ",\\"tab\\":" & tabCounter & "}"
+                    on error
+                        set output to output & "{\\"error\\":true}"
+                    end try
+                end repeat
+            end repeat
+            set output to output & "]}"
+        end repeat
+        set output to output & "]"
+        return output
+    end tell
+    '''
+    raw = run_osascript(script)
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        sanitized = re.sub(r'[\x00-\x1f]+', ' ', raw)
+        try:
+            data = json.loads(sanitized)
+        except json.JSONDecodeError:
+            return []
+
+    sessions = []
+    for win in data:
+        if "error" in win:
+            continue
+        for sess in win.get("sessions", []):
+            if sess.get("error"):
+                continue
+            sessions.append(Session(
+                window_id=win["wid"],
+                window_name=win["wname"],
+                session_id=sess["sid"],
+                session_name=sess["sname"],
+                tty=sess["tty"],
+                profile=sess["profile"],
+                columns=sess["cols"],
+                rows=sess["rows"],
+                bounds=tuple(win["bounds"]),
+            ))
+    return sessions
+
+
+def enrich_sessions(sessions):
+    tty_map = {}
+    for s in sessions:
+        short_tty = s.tty.replace("/dev/", "")
+        tty_map[short_tty] = s
+
+    ps_output = run_args(["ps", "-eo", "tty=,pid=,ppid=,pcpu=,rss=,etime=,command="])
+    tty_procs = defaultdict(list)
+    for line in ps_output.splitlines():
+        parts = line.split(None, 6)
+        if len(parts) < 7:
+            continue
+        tty, pid, ppid, cpu, rss, etime, cmd = parts
+        tty_procs[tty].append({
+            "pid": int(pid), "ppid": int(ppid),
+            "cpu": float(cpu), "rss": int(rss),
+            "etime": etime.strip(), "cmd": cmd.strip(),
+        })
+
+    shell_pids = {}
+    for tty_name, sess in tty_map.items():
+        procs = tty_procs.get(tty_name, [])
+        sess.processes = procs
+
+        for p in procs:
+            if p["cmd"].startswith("-bash") or p["cmd"].startswith("-zsh") or p["cmd"] in ("bash", "zsh"):
+                shell_pids[p["pid"]] = tty_name
+                sess.uptime = p["etime"]
+                break
+        else:
+            for p in procs:
+                if "login" in p["cmd"]:
+                    sess.uptime = p["etime"]
+                    break
+
+        for p in procs:
+            if p["cmd"].startswith("claude"):
+                sess.is_claude = True
+                sess.mem_kb = p["rss"]
+                sess.cpu = p["cpu"]
+                break
+
+        for p in procs:
+            if "sourcekit-lsp" in p["cmd"]:
+                sess.running_command = "sourcekit-lsp"
+                break
+
+        if not sess.running_command:
+            for p in procs:
+                cmd = p["cmd"]
+                if any(skip in cmd for skip in ["login ", "-bash", "-zsh", "bash", "zsh"]):
+                    continue
+                if cmd.startswith("claude"):
+                    sess.running_command = "claude"
+                elif "clangd" in cmd:
+                    pass
+                elif "caffeinate" in cmd:
+                    sess.running_command = "caffeinate"
+                else:
+                    sess.running_command = cmd.split()[0] if cmd else ""
+                break
+
+        sess.window_name = strip_iterm_prefix(sess.window_name)
+        sess.session_name = strip_iterm_prefix(sess.session_name)
+
+    if shell_pids:
+        pid_csv = ",".join(str(p) for p in shell_pids)
+        lsof_out = run_args(["lsof", "-a", "-d", "cwd", "-p", pid_csv, "-Fpn"], timeout=10)
+        current_pid = None
+        for line in lsof_out.splitlines():
+            if line.startswith("p"):
+                current_pid = int(line[1:])
+            elif line.startswith("n") and current_pid is not None:
+                path = line[1:]
+                tty_name = shell_pids.get(current_pid)
+                if tty_name and tty_name in tty_map:
+                    tty_map[tty_name].cwd = path
+                current_pid = None
+
+
+def find_git_root(path):
+    """Walk up from path to find the nearest .git directory."""
+    current = path
+    while True:
+        if os.path.isdir(os.path.join(current, ".git")):
+            return current
+        parent = os.path.dirname(current)
+        if parent == current:
+            return None
+        current = parent
+
+
+def get_git_status(path):
+    gs = GitStatus()
+    git_root = find_git_root(path)
+    if git_root is None:
+        return gs
+    gs.is_git = True
+    path = git_root
+
+    output = run_args(["git", "-C", path, "status", "--porcelain=v2", "--branch"])
+    for line in output.splitlines():
+        if line.startswith("# branch.head "):
+            gs.branch = line[len("# branch.head "):] or "HEAD"
+        elif line.startswith("# branch.ab "):
+            match = re.match(r'# branch\.ab \+(\d+) -(\d+)', line)
+            if match:
+                gs.ahead = int(match.group(1))
+                gs.behind = int(match.group(2))
+                gs.has_remote = True
+        elif not line.startswith("#"):
+            gs.dirty += 1
+
+    if gs.ahead == 0 and gs.behind == 0:
+        has_ab = any(l.startswith("# branch.ab ") for l in output.splitlines())
+        if not has_ab:
+            gs.has_remote = False
+
+    if not gs.branch:
+        gs.branch = "HEAD"
+
+    return gs
+
+
+# ── iTerm2 Window Focus ──────────────────────────────────────────────────────
+
+def raise_iterm_window(window_id):
+    script = f'''
+    tell application "iTerm2"
+        activate
+        repeat with w in every window
+            if id of w is {window_id} then
+                set index of w to 1
+            end if
+        end repeat
+    end tell'''
+    run_osascript(script)
+
+
+def raise_iterm_windows(window_ids):
+    conditions = " or ".join(f"id of w is {wid}" for wid in window_ids)
+    script = f'''
+    tell application "iTerm2"
+        activate
+        repeat with w in every window
+            if {conditions} then
+                set index of w to 1
+            end if
+        end repeat
+    end tell'''
+    run_osascript(script)
+
+
+# ── Formatting ────────────────────────────────────────────────────────────────
+
+NAME_WIDTH = 24
+
+
+def format_bytes(kb):
+    if kb == 0:
+        return ""
+    mb = kb / 1024
+    if mb >= 1024:
+        return f"{mb/1024:.1f}G"
+    return f"{mb:.0f}M"
+
+
+def parse_etime(etime):
+    days = 0
+    if "-" in etime:
+        d, rest = etime.split("-", 1)
+        days = int(d)
+        etime = rest
+    parts = [int(p) for p in etime.split(":")]
+    if len(parts) == 3:
+        return days * 86400 + parts[0] * 3600 + parts[1] * 60 + parts[2]
+    elif len(parts) == 2:
+        return days * 86400 + parts[0] * 60 + parts[1]
+    return days * 86400
+
+
+def format_uptime(etime):
+    secs = parse_etime(etime)
+    days = secs // 86400
+    hours = (secs % 86400) // 3600
+    mins = (secs % 3600) // 60
+    if days > 0:
+        return f"{days}d{hours}h"
+    if hours > 0:
+        return f"{hours}h{mins}m"
+    return f"{mins}m"
+
+
+def git_badge(gs):
+    if not gs.is_git:
+        return "[no git]"
+    parts = [gs.branch]
+    if gs.dirty:
+        parts.append(f"*{gs.dirty}")
+    else:
+        parts.append("\u2713")
+    if gs.has_remote:
+        if gs.ahead:
+            parts.append(f"\u2191{gs.ahead}")
+        if gs.behind:
+            parts.append(f"\u2193{gs.behind}")
+        if not gs.ahead and not gs.behind:
+            parts.append("=")
+    else:
+        parts.append("\u2298")
+    return "[" + " ".join(parts) + "]"
+
+
+# ── Colors ────────────────────────────────────────────────────────────────────
+
+MONO = None
+MONO_SM = None
+BOLD = None
+BOLD_SM = None
+
+# Semantic colors (resolved at init time)
+CLR_LABEL = None       # primary text
+CLR_SECONDARY = None   # secondary text (names)
+CLR_DIM = None         # dim/tertiary (pipes, connectors, tty)
+CLR_ACCENT = None      # accent blue (project names, branch)
+CLR_GREEN = None       # healthy / clean
+CLR_ORANGE = None      # warning
+CLR_RED = None         # danger / high usage
+CLR_PURPLE = None      # claude instances
+CLR_CYAN = None        # uptime
+
+
+def init_fonts_and_colors():
+    global MONO, MONO_SM, BOLD, BOLD_SM
+    global CLR_LABEL, CLR_SECONDARY, CLR_DIM, CLR_ACCENT
+    global CLR_GREEN, CLR_ORANGE, CLR_RED, CLR_PURPLE, CLR_CYAN
+
+    MONO = NSFont.fontWithName_size_("Menlo", 12.0) or NSFont.monospacedSystemFontOfSize_weight_(12.0, 0.0)
+    MONO_SM = NSFont.fontWithName_size_("Menlo", 11.0) or NSFont.monospacedSystemFontOfSize_weight_(11.0, 0.0)
+    BOLD = NSFont.fontWithName_size_("Menlo-Bold", 12.0) or NSFont.boldSystemFontOfSize_(12.0)
+    BOLD_SM = NSFont.fontWithName_size_("Menlo-Bold", 11.0) or NSFont.boldSystemFontOfSize_(11.0)
+
+    CLR_LABEL = NSColor.labelColor()
+    CLR_SECONDARY = NSColor.secondaryLabelColor()
+    CLR_DIM = NSColor.tertiaryLabelColor()
+    CLR_ACCENT = NSColor.systemBlueColor()
+    CLR_GREEN = NSColor.systemGreenColor()
+    CLR_ORANGE = NSColor.systemOrangeColor()
+    CLR_RED = NSColor.systemRedColor()
+    CLR_PURPLE = NSColor.systemPurpleColor()
+    CLR_CYAN = NSColor.systemCyanColor() if hasattr(NSColor, 'systemCyanColor') else NSColor.systemTealColor()
+
+
+# ── SF Symbols ────────────────────────────────────────────────────────────────
+
+def sf_symbol(name, color=None, size=13.0):
+    """Load an SF Symbol image, optionally tinted."""
+    img = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, None)
+    if img is None:
+        return None
+    # Apply a point size config
+    config = NSImageSymbolConfiguration.configurationWithPointSize_weight_(size, 0)  # 0 = regular
+    img = img.imageWithSymbolConfiguration_(config)
+    if color:
+        config_color = NSImageSymbolConfiguration.configurationPreferringHierarchical()
+        img = img.imageWithSymbolConfiguration_(config_color)
+        img.setTemplate_(False)
+        # For tinting, we create a config with the palette
+        try:
+            palette_config = NSImageSymbolConfiguration.configurationWithPaletteColors_([color])
+            img = img.imageWithSymbolConfiguration_(palette_config)
+        except Exception:
+            img.setTemplate_(True)
+    return img
+
+
+# ── Rich Text Builder ─────────────────────────────────────────────────────────
+
+def rich_text(segments, base_font=None):
+    """Build an NSMutableAttributedString from a list of (text, font, color) tuples."""
+    if base_font is None:
+        base_font = MONO_SM
+    result = NSMutableAttributedString.alloc().init()
+    for text, font, color in segments:
+        if font is None:
+            font = base_font
+        if color is None:
+            color = CLR_LABEL
+        attrs = NSDictionary.dictionaryWithObjects_forKeys_(
+            [font, color],
+            [NSFontAttributeName, NSForegroundColorAttributeName],
+        )
+        part = NSAttributedString.alloc().initWithString_attributes_(text, attrs)
+        result.appendAttributedString_(part)
+    return result
+
+
+def make_item(attr_string, indent=0, action=None, target=None, tag=0, image=None, tooltip=None):
+    """Create an NSMenuItem with rich attributed text, optional SF Symbol, tooltip."""
+    if action:
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("", action, "")
+        if target:
+            item.setTarget_(target)
+    else:
+        item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("", None, "")
+    item.setAttributedTitle_(attr_string)
+    item.setIndentationLevel_(indent)
+    item.setTag_(tag)
+    if image:
+        item.setImage_(image)
+    if tooltip:
+        item.setToolTip_(tooltip)
+    return item
+
+
+# ── Session line builder ──────────────────────────────────────────────────────
+
+def build_session_segments(s, is_last):
+    """Build rich text segments for a session line."""
+    connector = "\u2514\u2500" if is_last else "\u251C\u2500"
+    tty_short = s.tty.replace("/dev/", "")
+    name = s.window_name
+    if len(name) > NAME_WIDTH:
+        name = name[:NAME_WIDTH - 1] + "\u2026"
+    padded_name = name.ljust(NAME_WIDTH)
+    uptime = format_uptime(s.uptime) if s.uptime else ""
+    uptime_secs = parse_etime(s.uptime) if s.uptime else 0
+
+    # Uptime color: green < 1d, cyan < 3d, orange < 5d, red >= 5d
+    if uptime_secs >= 5 * 86400:
+        uptime_clr = CLR_RED
+    elif uptime_secs >= 3 * 86400:
+        uptime_clr = CLR_ORANGE
+    elif uptime_secs >= 1 * 86400:
+        uptime_clr = CLR_CYAN
+    else:
+        uptime_clr = CLR_GREEN
+
+    # Name color: purple for claude, secondary for shells
+    name_clr = CLR_PURPLE if s.is_claude else CLR_SECONDARY
+
+    segments = [
+        (f" {connector} ", MONO_SM, CLR_DIM),
+        (padded_name, BOLD_SM if s.is_claude else MONO_SM, name_clr),
+    ]
+
+    if s.is_claude:
+        mem_str = format_bytes(s.mem_kb).rjust(5)
+        mem_mb = s.mem_kb / 1024
+        mem_clr = CLR_RED if mem_mb >= 800 else CLR_ORANGE if mem_mb >= 400 else CLR_GREEN
+
+        cpu_str = f"{s.cpu:.0f}%".rjust(4) if s.cpu >= 1.0 else "    "
+        cpu_clr = CLR_RED if s.cpu >= 50 else CLR_ORANGE if s.cpu >= 10 else CLR_DIM
+
+        segments += [
+            (" ", MONO_SM, None),
+            (mem_str, MONO_SM, mem_clr),
+            (" ", MONO_SM, None),
+            (cpu_str, MONO_SM, cpu_clr if s.cpu >= 1.0 else CLR_DIM),
+            (" \u2502 ", MONO_SM, CLR_DIM),
+            (tty_short, MONO_SM, CLR_DIM),
+            (" \u2502 ", MONO_SM, CLR_DIM),
+            (uptime, MONO_SM, uptime_clr),
+        ]
+    else:
+        segments += [
+            ("            \u2502 ", MONO_SM, CLR_DIM),
+            (tty_short, MONO_SM, CLR_DIM),
+            (" \u2502 ", MONO_SM, CLR_DIM),
+            (uptime, MONO_SM, uptime_clr),
+        ]
+
+    return segments
+
+
+def build_project_header_segments(proj_name, gs, warning):
+    """Build rich text segments for a project header."""
+    badge = git_badge(gs)
+    segments = [
+        (f"{proj_name}  ", BOLD, CLR_ACCENT),
+    ]
+    # Color the badge based on status
+    if not gs.is_git:
+        segments.append((badge, MONO_SM, CLR_DIM))
+    elif gs.dirty > 20:
+        segments.append((badge, MONO_SM, CLR_RED))
+    elif gs.dirty > 0:
+        segments.append((badge, MONO_SM, CLR_ORANGE))
+    else:
+        segments.append((badge, MONO_SM, CLR_GREEN))
+
+    if warning:
+        segments.append((f" {warning}", MONO_SM, CLR_RED))
+
+    return segments
+
+
+def build_insight_segments(text):
+    """Build rich segments for a system insight line."""
+    if text.startswith("[!]"):
+        return [
+            ("[!]", BOLD_SM, CLR_ORANGE),
+            (text[3:], MONO_SM, CLR_LABEL),
+        ]
+    elif text.startswith("[i]"):
+        return [
+            ("[i]", BOLD_SM, CLR_CYAN),
+            (text[3:], MONO_SM, CLR_SECONDARY),
+        ]
+    return [(text, MONO_SM, CLR_SECONDARY)]
+
+
+# ── Data Collection ───────────────────────────────────────────────────────────
+
+def collect_menu_data():
+    """Collect all data. Returns (data, session_map, project_window_map)."""
+    sessions = get_iterm_sessions()
+    if not sessions:
+        return None, {}, {}
+
+    enrich_sessions(sessions)
+
+    home = os.path.expanduser("~")
+    projects = defaultdict(list)
+    unassigned = []
+
+    for s in sessions:
+        if not s.cwd or s.cwd == home:
+            unassigned.append(s)
+        else:
+            projects[s.cwd].append(s)
+
+    def oldest_session_age(sess_list):
+        """Return the age in seconds of the oldest session in the list."""
+        max_age = 0
+        for s in sess_list:
+            if s.uptime:
+                age = parse_etime(s.uptime)
+                if age > max_age:
+                    max_age = age
+        return max_age
+
+    # Sort projects: oldest session first (most established workspaces at top)
+    sorted_projects = sorted(projects.items(), key=lambda x: -oldest_session_age(x[1]))
+
+    git_statuses = {}
+    for path, _ in sorted_projects:
+        git_statuses[path] = get_git_status(path)
+
+    total_claude = 0
+    total_claude_mem = 0
+    total_lsp = 0
+    old_claude = []
+
+    for s in sessions:
+        if s.is_claude:
+            total_claude += 1
+            total_claude_mem += s.mem_kb
+            if s.uptime and parse_etime(s.uptime) > 5 * 86400:
+                old_claude.append(s)
+        if s.running_command == "sourcekit-lsp":
+            total_lsp += 1
+
+    data = {
+        "projects": [],
+        "unassigned": [],
+        "insights": [],
+        "summary_segments": [],
+    }
+
+    session_map = {}
+    project_window_map = {}
+    tag_counter = 1000
+
+    for proj_path, sess_list in sorted_projects:
+        gs = git_statuses[proj_path]
+        proj_name = os.path.basename(proj_path)
+        warning = "\u26A0\uFE0F" if gs.dirty > 20 else ""
+
+        proj_tag = tag_counter
+        tag_counter += 1
+        proj_window_ids = [s.window_id for s in sess_list]
+        project_window_map[proj_tag] = proj_window_ids
+
+        claude_sessions = []
+        named_sessions = []
+        shell_sessions = []
+
+        for s in sess_list:
+            sname_lower = s.window_name.lower()
+            if s.is_claude:
+                claude_sessions.append(s)
+            elif re.match(r'^default\s*\(', sname_lower) or sname_lower.startswith("(-bash") or sname_lower.startswith("(-zsh"):
+                shell_sessions.append(s)
+            else:
+                named_sessions.append(s)
+
+        # Within each group, sort by newest first (smallest uptime = most recent)
+        def session_age(s):
+            return parse_etime(s.uptime) if s.uptime else 0
+        claude_sessions.sort(key=session_age)
+        named_sessions.sort(key=session_age)
+        shell_sessions.sort(key=session_age)
+        all_display = claude_sessions + named_sessions + shell_sessions
+
+        session_entries = []
+        for i, s in enumerate(all_display):
+            is_last = (i == len(all_display) - 1)
+            segments = build_session_segments(s, is_last)
+            s_tag = tag_counter
+            tag_counter += 1
+            session_map[s_tag] = s.window_id
+            # Build tooltip
+            proc_names = [p["cmd"].split()[0] for p in s.processes
+                          if not any(skip in p["cmd"] for skip in ["login", "-bash", "-zsh"])]
+            tooltip = f"Path: {s.cwd}\nProfile: {s.profile}\nSize: {s.columns}x{s.rows}"
+            if proc_names:
+                tooltip += f"\nProcesses: {', '.join(proc_names[:5])}"
+            if s.is_claude:
+                tooltip += f"\nMemory: {format_bytes(s.mem_kb)}  CPU: {s.cpu}%"
+
+            session_entries.append({
+                "segments": segments,
+                "tag": s_tag,
+                "is_claude": s.is_claude,
+                "tooltip": tooltip,
+            })
+
+        data["projects"].append({
+            "header_segments": build_project_header_segments(proj_name, gs, warning),
+            "tag": proj_tag,
+            "sessions": session_entries,
+            "path": proj_path,
+            "session_count": len(all_display),
+            "claude_count": len(claude_sessions),
+        })
+
+    for i, s in enumerate(unassigned):
+        is_last = (i == len(unassigned) - 1)
+        segments = build_session_segments(s, is_last)
+        s_tag = tag_counter
+        tag_counter += 1
+        session_map[s_tag] = s.window_id
+        tooltip = f"Path: {s.cwd or '~'}\nProfile: {s.profile}\nSize: {s.columns}x{s.rows}"
+        data["unassigned"].append({
+            "segments": segments,
+            "tag": s_tag,
+            "is_claude": s.is_claude,
+            "tooltip": tooltip,
+        })
+
+    total_mem_str = format_bytes(total_claude_mem)
+    data["insights"].append(f"[!] {total_claude} Claude instances (~{total_mem_str} RAM)")
+
+    for proj_path, sess_list in sorted_projects:
+        gs = git_statuses[proj_path]
+        proj_name = os.path.basename(proj_path)
+        for s in sess_list:
+            if s.mem_kb > 500 * 1024:
+                data["insights"].append(f"[!] {proj_name}: {format_bytes(s.mem_kb)} ({s.window_name})")
+        if gs.dirty > 15:
+            data["insights"].append(f"[!] {proj_name}: {gs.dirty} dirty files")
+        if gs.ahead > 3:
+            data["insights"].append(f"[!] {proj_name}: {gs.ahead} commits ahead")
+
+    if total_lsp:
+        data["insights"].append(f"[i] {total_lsp} Swift LSP servers active")
+    if old_claude:
+        data["insights"].append(f"[i] {len(old_claude)} Claude instances >5d old")
+
+    shell_count = sum(1 for s in sessions if not s.is_claude and re.match(r'(?i)^default\s*\(', s.window_name))
+    data["summary_segments"] = [
+        (f"{len(sessions)}", BOLD_SM, CLR_ACCENT),
+        (" win ", MONO_SM, CLR_DIM),
+        ("\u2502", MONO_SM, CLR_DIM),
+        (f" {total_claude}", BOLD_SM, CLR_PURPLE),
+        (" claude ", MONO_SM, CLR_DIM),
+        ("\u2502", MONO_SM, CLR_DIM),
+        (f" {shell_count}", BOLD_SM, CLR_SECONDARY),
+        (" shell ", MONO_SM, CLR_DIM),
+        ("\u2502", MONO_SM, CLR_DIM),
+        (f" {total_lsp}", BOLD_SM, CLR_CYAN),
+        (" LSP", MONO_SM, CLR_DIM),
+    ]
+
+    return data, session_map, project_window_map
+
+
+# ── App Delegate ──────────────────────────────────────────────────────────────
+
+class AppDelegate(NSObject):
+    _status_item = objc.ivar()
+    _cached_data = objc.ivar()
+    _session_map = objc.ivar()
+    _project_window_map = objc.ivar()
+    _lock = objc.ivar()
+    _refresh_timer = objc.ivar()
+
+    def applicationDidFinishLaunching_(self, notification):
+        init_fonts_and_colors()
+
+        self._cached_data = None
+        self._session_map = {}
+        self._project_window_map = {}
+        self._lock = threading.Lock()
+
+        status_bar = NSStatusBar.systemStatusBar()
+        self._status_item = status_bar.statusItemWithLength_(NSVariableStatusItemLength)
+
+        # Use SF Symbol for the status bar icon
+        bar_icon = sf_symbol("terminal.fill", size=14.0)
+        if bar_icon:
+            bar_icon.setTemplate_(True)  # adapts to light/dark menu bar
+            self._status_item.button().setImage_(bar_icon)
+        else:
+            self._status_item.setTitle_(">_")
+
+        menu = NSMenu.alloc().init()
+        menu.setDelegate_(self)
+        self._status_item.setMenu_(menu)
+
+        self._start_refresh()
+
+        self._refresh_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            30.0, self, "timerRefresh:", None, True
+        )
+
+    def timerRefresh_(self, timer):
+        self._start_refresh()
+
+    def _start_refresh(self):
+        thread = threading.Thread(target=self._bg_refresh, daemon=True)
+        thread.start()
+
+    def _bg_refresh(self):
+        data, session_map, project_window_map = collect_menu_data()
+        with self._lock:
+            self._cached_data = data
+            self._session_map = session_map
+            self._project_window_map = project_window_map
+        self.performSelectorOnMainThread_withObject_waitUntilDone_("_updateMenu", None, False)
+
+    def _updateMenu(self):
+        with self._lock:
+            data = self._cached_data
+
+        menu = NSMenu.alloc().init()
+        menu.setDelegate_(self)
+        menu.setAutoenablesItems_(False)
+
+        if data is None:
+            loading = rich_text([("Loading...", MONO_SM, CLR_DIM)])
+            menu.addItem_(make_item(loading))
+            self._status_item.setMenu_(menu)
+            return
+
+        # ── Workspaces header ──
+        header_text = rich_text([
+            ("WORKSPACES", BOLD, CLR_LABEL),
+            (f"  ({len(data['projects'])})", MONO_SM, CLR_DIM),
+        ])
+        header_icon = sf_symbol("square.grid.2x2.fill", color=CLR_ACCENT, size=12.0)
+        menu.addItem_(make_item(header_text, image=header_icon))
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        for proj in data["projects"]:
+            # Project header with folder icon
+            proj_text = rich_text(proj["header_segments"])
+            folder_icon = sf_symbol("folder.fill", color=CLR_ACCENT, size=12.0)
+            item = make_item(
+                proj_text, action="projectClicked:", target=self,
+                tag=proj["tag"], image=folder_icon,
+                tooltip=f"{proj['path']}\n{proj['session_count']} sessions, {proj['claude_count']} Claude",
+            )
+            item.setEnabled_(True)
+            menu.addItem_(item)
+
+            for sess in proj["sessions"]:
+                sess_text = rich_text(sess["segments"])
+                # SF Symbol per session type
+                if sess["is_claude"]:
+                    sess_icon = sf_symbol("cpu.fill", color=CLR_PURPLE, size=11.0)
+                else:
+                    sess_icon = sf_symbol("apple.terminal.fill", color=CLR_SECONDARY, size=11.0)
+
+                item = make_item(
+                    sess_text, indent=1, action="sessionClicked:", target=self,
+                    tag=sess["tag"], image=sess_icon, tooltip=sess["tooltip"],
+                )
+                item.setEnabled_(True)
+                menu.addItem_(item)
+
+            menu.addItem_(NSMenuItem.separatorItem())
+
+        # ── Unassigned ──
+        if data["unassigned"]:
+            unassigned_text = rich_text([
+                ("GLOBAL", BOLD, CLR_LABEL),
+                ("  / UNASSIGNED", MONO_SM, CLR_DIM),
+            ])
+            globe_icon = sf_symbol("globe", color=CLR_SECONDARY, size=12.0)
+            menu.addItem_(make_item(unassigned_text, image=globe_icon))
+
+            for sess in data["unassigned"]:
+                sess_text = rich_text(sess["segments"])
+                if sess["is_claude"]:
+                    sess_icon = sf_symbol("cpu.fill", color=CLR_PURPLE, size=11.0)
+                else:
+                    sess_icon = sf_symbol("apple.terminal.fill", color=CLR_SECONDARY, size=11.0)
+                item = make_item(
+                    sess_text, indent=1, action="sessionClicked:", target=self,
+                    tag=sess["tag"], image=sess_icon, tooltip=sess["tooltip"],
+                )
+                item.setEnabled_(True)
+                menu.addItem_(item)
+
+            menu.addItem_(NSMenuItem.separatorItem())
+
+        # ── System Insights ──
+        insights_text = rich_text([("SYSTEM INSIGHTS", BOLD, CLR_LABEL)])
+        insights_icon = sf_symbol("chart.bar.fill", color=CLR_ORANGE, size=12.0)
+        menu.addItem_(make_item(insights_text, image=insights_icon))
+
+        for line in data["insights"]:
+            segments = build_insight_segments(line)
+            line_text = rich_text(segments)
+            # Icon based on severity
+            if line.startswith("[!]"):
+                ico = sf_symbol("exclamationmark.triangle.fill", color=CLR_ORANGE, size=10.0)
+            else:
+                ico = sf_symbol("info.circle.fill", color=CLR_CYAN, size=10.0)
+            menu.addItem_(make_item(line_text, indent=1, image=ico))
+
+        menu.addItem_(NSMenuItem.separatorItem())
+
+        # ── Summary ──
+        summary_text = rich_text(data["summary_segments"])
+        menu.addItem_(make_item(summary_text, indent=1))
+
+        menu.addItem_(NSMenuItem.separatorItem())
+        quit_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_("Quit", "terminate:", "q")
+        menu.addItem_(quit_item)
+
+        self._status_item.setMenu_(menu)
+
+    def sessionClicked_(self, sender):
+        tag = sender.tag()
+        with self._lock:
+            window_id = self._session_map.get(tag)
+        if window_id is not None:
+            threading.Thread(target=raise_iterm_window, args=(window_id,), daemon=True).start()
+
+    def projectClicked_(self, sender):
+        tag = sender.tag()
+        with self._lock:
+            window_ids = self._project_window_map.get(tag, [])
+        if window_ids:
+            threading.Thread(target=raise_iterm_windows, args=(window_ids,), daemon=True).start()
+
+    def menuWillOpen_(self, menu):
+        self._start_refresh()
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main():
+    app = NSApplication.sharedApplication()
+    app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+
+    delegate = AppDelegate.alloc().init()
+    app.setDelegate_(delegate)
+
+    app.run()
+
+
+if __name__ == "__main__":
+    main()
