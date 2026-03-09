@@ -57,6 +57,8 @@ class Session:
     remote_type: str = ""  # ssh|kubectl|docker|psql|mysql|mosh|et
     remote_target: str = ""
     is_production: bool = False
+    # Source app for raise-to-front
+    app_source: str = "iTerm2"  # "iTerm2" or "Nexus"
 
 
 @dataclass
@@ -217,6 +219,119 @@ def get_iterm_sessions():
     return sessions
 
 
+def get_nexus_sessions():
+    """Query Nexus for windows/sessions via AppleScript, same shape as iTerm."""
+    script = '''
+    on escapeForJSON(theText)
+        set out to ""
+        repeat with c in characters of theText
+            set c to c as text
+            if c is "\\\\" then
+                set out to out & "\\\\\\\\"
+            else if c is "\\"" then
+                set out to out & "\\\\\\""
+            else if c is tab then
+                set out to out & "\\\\t"
+            else if c is return then
+                set out to out & "\\\\n"
+            else if c is (ASCII character 10) then
+                set out to out & "\\\\n"
+            else
+                set out to out & c
+            end if
+        end repeat
+        return out
+    end escapeForJSON
+
+    tell application "Nexus"
+        set output to "["
+        set first_win to true
+        repeat with w in every window
+            if not first_win then set output to output & ","
+            set first_win to false
+            set wId to id of w
+            set wName to my escapeForJSON(name of w)
+            set wBounds to bounds of w
+            set output to output & "{\\"wid\\":" & wId
+            set output to output & ",\\"wname\\":\\"" & wName & "\\""
+            set output to output & ",\\"bounds\\":[" & item 1 of wBounds & "," & item 2 of wBounds & "," & item 3 of wBounds & "," & item 4 of wBounds & "]"
+            set output to output & ",\\"sessions\\":["
+            set first_sess to true
+            set tabCounter to 0
+            repeat with t in every tab of w
+                set tabCounter to tabCounter + 1
+                repeat with s in every session of t
+                    if not first_sess then set output to output & ","
+                    set first_sess to false
+                    try
+                        set sUID to id of s
+                        set sName to my escapeForJSON(name of s)
+                        set sTTY to tty of s
+                        set sCWD to cwd of s
+                        set sCols to columns of s
+                        set sRows to rows of s
+                        set sCmd to my escapeForJSON(command of s)
+                        set sBusy to is busy of s
+                        set output to output & "{\\"sid\\":\\"" & sUID & "\\""
+                        set output to output & ",\\"sname\\":\\"" & sName & "\\""
+                        set output to output & ",\\"tty\\":\\"" & sTTY & "\\""
+                        set output to output & ",\\"cwd\\":\\"" & sCWD & "\\""
+                        set output to output & ",\\"cols\\":" & sCols
+                        set output to output & ",\\"rows\\":" & sRows
+                        set output to output & ",\\"cmd\\":\\"" & sCmd & "\\""
+                        set output to output & ",\\"busy\\":" & sBusy
+                        set output to output & ",\\"tab\\":" & tabCounter & "}"
+                    on error
+                        set output to output & "{\\"error\\":true}"
+                    end try
+                end repeat
+            end repeat
+            set output to output & "]}"
+        end repeat
+        set output to output & "]"
+        return output
+    end tell
+    '''
+    raw = run_osascript(script)
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        sanitized = re.sub(r'[\x00-\x1f]+', ' ', raw)
+        try:
+            data = json.loads(sanitized)
+        except json.JSONDecodeError:
+            return []
+
+    sessions = []
+    for win in data:
+        if "error" in win:
+            continue
+        for sess in win.get("sessions", []):
+            if sess.get("error"):
+                continue
+            s = Session(
+                window_id=win["wid"],
+                window_name=win["wname"],
+                session_id=sess["sid"],
+                session_name=sess["sname"],
+                tty=sess.get("tty", ""),
+                profile="",
+                columns=sess["cols"],
+                rows=sess["rows"],
+                bounds=tuple(win["bounds"]),
+                app_source="Nexus",
+            )
+            # Nexus provides cwd and running command directly
+            s.cwd = sess.get("cwd", "")
+            s.running_command = sess.get("cmd", "")
+            if sess.get("busy"):
+                s.activity_state = "active"
+            sessions.append(s)
+    return sessions
+
+
 SHELL_NAMES = {"bash", "zsh", "-bash", "-zsh", "fish", "-fish", "sh", "-sh"}
 SKIP_CMDS = {"login", "-bash", "-zsh", "bash", "zsh", "fish", "-fish", "sh", "-sh"}
 
@@ -304,9 +419,30 @@ def _detect_remote(full_cmd):
 
 def enrich_sessions(sessions):
     tty_map = {}
+    nexus_no_tty = []  # Nexus sessions without a TTY (builtins)
     for s in sessions:
-        short_tty = s.tty.replace("/dev/", "")
-        tty_map[short_tty] = s
+        if s.tty:
+            short_tty = s.tty.replace("/dev/", "")
+            tty_map[short_tty] = s
+        elif s.app_source == "Nexus":
+            nexus_no_tty.append(s)
+
+    # Enrich Nexus builtin sessions (no TTY) from their AppleScript-provided data
+    for s in nexus_no_tty:
+        cmd = s.running_command
+        if cmd:
+            cmd_base = os.path.basename(cmd.split()[0]) if cmd.split() else ""
+            s.fg_command = cmd_base
+            s.role = _classify_role(cmd_base, cmd)
+            rtype, rtarget, is_prod = _detect_remote(cmd)
+            if rtype:
+                s.remote_type = rtype
+                s.remote_target = rtarget
+                s.is_production = is_prod
+                s.role = "remote"
+            if "claude" in cmd.lower():
+                s.is_claude = True
+                s.role = "agent"
 
     ps_output = run_args(["ps", "-eo", "tty=,pid=,ppid=,pcpu=,rss=,etime=,command="])
     tty_procs = defaultdict(list)
@@ -424,7 +560,9 @@ def enrich_sessions(sessions):
                 path = line[1:]
                 tty_name = shell_pids.get(current_pid)
                 if tty_name and tty_name in tty_map:
-                    tty_map[tty_name].cwd = path
+                    # Don't overwrite cwd already provided by the app (e.g. Nexus)
+                    if not tty_map[tty_name].cwd:
+                        tty_map[tty_name].cwd = path
                 current_pid = None
 
 
@@ -531,9 +669,9 @@ def get_git_status(path):
 
 # ── iTerm2 Window Focus ──────────────────────────────────────────────────────
 
-def raise_iterm_window(window_id):
+def raise_app_window(window_id, app="iTerm2"):
     script = f'''
-    tell application "iTerm2"
+    tell application "{app}"
         activate
         repeat with w in every window
             if id of w is {window_id} then
@@ -563,7 +701,7 @@ def _get_screen_bounds():
     return (0, 25, 1920, 1080)
 
 
-def _tile_windows_if_overlapping(window_ids):
+def _tile_windows_if_overlapping(window_ids, app="iTerm2"):
     """
     Moves windows optimally to eliminate overlaps using a Global Stochastic Optimizer.
     Treats all windows as movable variables to find the true global minimum displacement.
@@ -581,7 +719,7 @@ def _tile_windows_if_overlapping(window_ids):
             end if''')
 
     read_script = f'''
-    tell application "iTerm2"
+    tell application "{app}"
         set output to ""
         repeat with w in every window
             {"".join(read_parts)}
@@ -749,14 +887,23 @@ def _tile_windows_if_overlapping(window_ids):
                     set bounds of w to {{{final_x}, {final_y}, {final_x + w}, {final_y + h}}}
                 end if''')
 
+    if set_parts:
+        set_script = f'''
+        tell application "{app}"
+            repeat with w in every window
+                {"".join(set_parts)}
+            end repeat
+        end tell'''
+        run_osascript(set_script)
 
-def raise_iterm_windows(window_ids):
+
+def raise_app_windows(window_ids, app="iTerm2"):
     # First tile if overlapping, then raise
-    _tile_windows_if_overlapping(window_ids)
+    _tile_windows_if_overlapping(window_ids, app)
 
     conditions = " or ".join(f"id of w is {wid}" for wid in window_ids)
     script = f'''
-    tell application "iTerm2"
+    tell application "{app}"
         activate
         repeat with w in every window
             if {conditions} then
@@ -1241,6 +1388,12 @@ def _compute_deltas(prev, curr, sorted_projects, git_statuses):
 def collect_menu_data(prev_snapshot=None):
     """Collect all data. Returns (data, session_map, project_window_map, snapshot)."""
     sessions = get_iterm_sessions()
+    # Also query Nexus if it's running
+    try:
+        nexus_sessions = get_nexus_sessions()
+        sessions.extend(nexus_sessions)
+    except Exception:
+        pass
     if not sessions:
         return None, {}, {}, None
 
@@ -1329,8 +1482,9 @@ def collect_menu_data(prev_snapshot=None):
 
         proj_tag = tag_counter
         tag_counter += 1
+        proj_app = sess_list[0].app_source if sess_list else "iTerm2"
         proj_window_ids = [s.window_id for s in sess_list]
-        project_window_map[proj_tag] = proj_window_ids
+        project_window_map[proj_tag] = (proj_window_ids, proj_app)
 
         # Group sessions by sub-project (relative path within the git root)
         subdir_groups = defaultdict(list)
@@ -1378,16 +1532,18 @@ def collect_menu_data(prev_snapshot=None):
             if has_subdirs and subdir_name != ".":
                 sub_tag = tag_counter
                 tag_counter += 1
+                sub_app = sorted_group[0].app_source if sorted_group else proj_app
                 sub_window_ids = list(set(s.window_id for s in sorted_group))
-                project_window_map[sub_tag] = sub_window_ids
+                project_window_map[sub_tag] = (sub_window_ids, sub_app)
                 subheader_positions[start_idx] = (subdir_name, sub_tag)
                 for j in range(len(sorted_group)):
                     in_subgroup_indices.add(start_idx + j)
             elif has_subdirs and subdir_name == ".":
                 sub_tag = tag_counter
                 tag_counter += 1
+                sub_app = sorted_group[0].app_source if sorted_group else proj_app
                 sub_window_ids = list(set(s.window_id for s in sorted_group))
-                project_window_map[sub_tag] = sub_window_ids
+                project_window_map[sub_tag] = (sub_window_ids, sub_app)
                 subheader_positions[start_idx] = (proj_name + "/", sub_tag)
                 for j in range(len(sorted_group)):
                     in_subgroup_indices.add(start_idx + j)
@@ -1413,7 +1569,7 @@ def collect_menu_data(prev_snapshot=None):
             segments = build_session_segments(s, is_last_in_group)
             s_tag = tag_counter
             tag_counter += 1
-            session_map[s_tag] = s.window_id
+            session_map[s_tag] = (s.window_id, s.app_source)
 
             # Build rich tooltip
             proc_names = [p["cmd"].split()[0] for p in s.processes
@@ -1768,16 +1924,18 @@ class AppDelegate(NSObject):
     def sessionClicked_(self, sender):
         tag = sender.tag()
         with self._lock:
-            window_id = self._session_map.get(tag)
-        if window_id is not None:
-            threading.Thread(target=raise_iterm_window, args=(window_id,), daemon=True).start()
+            entry = self._session_map.get(tag)
+        if entry is not None:
+            window_id, app = entry
+            threading.Thread(target=raise_app_window, args=(window_id, app), daemon=True).start()
 
     def projectClicked_(self, sender):
         tag = sender.tag()
         with self._lock:
-            window_ids = self._project_window_map.get(tag, [])
-        if window_ids:
-            threading.Thread(target=raise_iterm_windows, args=(window_ids,), daemon=True).start()
+            entry = self._project_window_map.get(tag, None)
+        if entry:
+            window_ids, app = entry
+            threading.Thread(target=raise_app_windows, args=(window_ids, app), daemon=True).start()
 
     def menuWillOpen_(self, menu):
         self._start_refresh()
