@@ -7,6 +7,8 @@ import re
 import os
 import time
 import threading
+import random
+import math
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -542,7 +544,216 @@ def raise_iterm_window(window_id):
     run_osascript(script)
 
 
+def _get_screen_bounds():
+    """Get usable screen area (excluding menu bar) via AppleScript."""
+    raw = run_osascript('''
+        tell application "Finder"
+            set db to bounds of window of desktop
+            return (item 1 of db as text) & "," & (item 2 of db as text) & "," & (item 3 of db as text) & "," & (item 4 of db as text)
+        end tell
+    ''')
+    if raw:
+        try:
+            parts = [int(x.strip()) for x in raw.split(",")]
+            if len(parts) == 4:
+                # Adjust top for menu bar (~25px)
+                return (parts[0], max(parts[1], 25), parts[2], parts[3])
+        except ValueError:
+            pass
+    return (0, 25, 1920, 1080)
+
+
+def _tile_windows_if_overlapping(window_ids):
+    """
+    Moves windows optimally to eliminate overlaps using a Global Stochastic Optimizer.
+    Treats all windows as movable variables to find the true global minimum displacement.
+    """
+    if len(window_ids) <= 1:
+        return
+
+    # 1. Read current bounds for each window
+    read_parts = []
+    for wid in window_ids:
+        read_parts.append(f'''
+            if id of w is {wid} then
+                set b to bounds of w
+                set output to output & "{wid}," & item 1 of b & "," & item 2 of b & "," & item 3 of b & "," & item 4 of b & linefeed
+            end if''')
+
+    read_script = f'''
+    tell application "iTerm2"
+        set output to ""
+        repeat with w in every window
+            {"".join(read_parts)}
+        end repeat
+        return output
+    end tell'''
+
+    raw = run_osascript(read_script)
+    if not raw:
+        return
+
+    orig_positions = {}
+    sizes = {}
+    for line in raw.strip().splitlines():
+        parts = line.strip().split(",")
+        if len(parts) == 5:
+            try:
+                wid = int(parts[0])
+                x1, y1, x2, y2 = int(parts[1]), int(parts[2]), int(parts[3]), int(parts[4])
+                orig_positions[wid] = (x1, y1)
+                sizes[wid] = (x2 - x1, y2 - y1)
+            except ValueError:
+                continue
+
+    if len(orig_positions) < 2:
+        return
+
+    # Check if any pair actually overlaps before running solver
+    wid_list = list(orig_positions.keys())
+    has_overlap = False
+    for i in range(len(wid_list)):
+        for j in range(i + 1, len(wid_list)):
+            w1, w2 = wid_list[i], wid_list[j]
+            x1, y1 = orig_positions[w1]
+            x2, y2 = orig_positions[w2]
+            ww1, hh1 = sizes[w1]
+            ww2, hh2 = sizes[w2]
+            if not (x1 + ww1 <= x2 or x2 + ww2 <= x1 or y1 + hh1 <= y2 or y2 + hh2 <= y1):
+                has_overlap = True
+                break
+        if has_overlap:
+            break
+    if not has_overlap:
+        return
+
+    screen = _get_screen_bounds()
+    sx1, sy1, sx2, sy2 = screen
+
+    def calculate_energy(state):
+        disp = 0
+        overlap = 0
+        wids = list(state.keys())
+
+        for i in range(len(wids)):
+            w1 = wids[i]
+            x1, y1 = state[w1]
+            ox, oy = orig_positions[w1]
+            disp += (x1 - ox) ** 2 + (y1 - oy) ** 2
+
+            for j in range(i + 1, len(wids)):
+                w2 = wids[j]
+                x2, y2 = state[w2]
+                width1, height1 = sizes[w1]
+                width2, height2 = sizes[w2]
+
+                ix = max(0, min(x1 + width1, x2 + width2) - max(x1, x2))
+                iy = max(0, min(y1 + height1, y2 + height2) - max(y1, y2))
+
+                if ix > 0 and iy > 0:
+                    overlap += min(ix, iy) ** 2
+
+        return disp, overlap
+
+    n_windows = len(orig_positions)
+    restarts = 100 if n_windows <= 6 else 20
+    steps_per_restart = 800 if n_windows <= 6 else 400
+
+    best_overall_state = None
+    best_overall_disp = float('inf')
+
+    # 2. Basin Hopping / Simulated Annealing
+    for attempt in range(restarts):
+        current_state = {}
+
+        for wid in orig_positions:
+            if attempt == 0:
+                current_state[wid] = list(orig_positions[wid])
+            else:
+                ox, oy = orig_positions[wid]
+                w, h = sizes[wid]
+                nx = ox + random.randint(-200, 200)
+                ny = oy + random.randint(-200, 200)
+                current_state[wid] = [
+                    max(sx1, min(nx, max(sx1, sx2 - w))),
+                    max(sy1, min(ny, max(sy1, sy2 - h)))
+                ]
+
+        curr_disp, curr_overlap = calculate_energy(current_state)
+        temperature = 1000.0
+        cooling_rate = 0.99
+
+        for step in range(steps_per_restart):
+            wid = random.choice(list(current_state.keys()))
+            old_x, old_y = current_state[wid]
+            w, h = sizes[wid]
+
+            rand_val = random.random()
+            if rand_val < 0.4:
+                nx = old_x + random.uniform(-30, 30)
+                ny = old_y + random.uniform(-30, 30)
+            elif rand_val < 0.8:
+                snap_proposals = [
+                    (sx1, old_y), (max(sx1, sx2 - w), old_y),
+                    (old_x, sy1), (old_x, max(sy1, sy2 - h))
+                ]
+                for other in current_state:
+                    if other != wid:
+                        oox, ooy = current_state[other]
+                        ow, oh = sizes[other]
+                        snap_proposals.extend([
+                            (oox - w, old_y), (oox + ow, old_y),
+                            (old_x, ooy - h), (old_x, ooy + oh)
+                        ])
+                nx, ny = random.choice(snap_proposals)
+            else:
+                nx, ny = orig_positions[wid]
+
+            nx = max(sx1, min(nx, max(sx1, sx2 - w)))
+            ny = max(sy1, min(ny, max(sy1, sy2 - h)))
+
+            current_state[wid] = [nx, ny]
+            new_disp, new_overlap = calculate_energy(current_state)
+
+            old_energy = curr_disp + 1000000 * curr_overlap
+            new_energy = new_disp + 1000000 * new_overlap
+
+            if new_energy < old_energy:
+                curr_disp, curr_overlap = new_disp, new_overlap
+            else:
+                diff = new_energy - old_energy
+                if temperature > 0.01 and math.exp(-diff / max(temperature, 0.001)) > random.random():
+                    curr_disp, curr_overlap = new_disp, new_overlap
+                else:
+                    current_state[wid] = [old_x, old_y]
+
+            temperature *= cooling_rate
+
+        if curr_overlap == 0 and curr_disp < best_overall_disp:
+            best_overall_disp = curr_disp
+            best_overall_state = {k: list(v) for k, v in current_state.items()}
+
+    # 3. Apply positions via AppleScript
+    if not best_overall_state:
+        return
+
+    set_parts = []
+    for wid, pos in best_overall_state.items():
+        orig_x, orig_y = orig_positions[wid]
+        w, h = sizes[wid]
+        final_x, final_y = int(round(pos[0])), int(round(pos[1]))
+
+        if final_x != orig_x or final_y != orig_y:
+            set_parts.append(f'''
+                if id of w is {wid} then
+                    set bounds of w to {{{final_x}, {final_y}, {final_x + w}, {final_y + h}}}
+                end if''')
+
+
 def raise_iterm_windows(window_ids):
+    # First tile if overlapping, then raise
+    _tile_windows_if_overlapping(window_ids)
+
     conditions = " or ".join(f"id of w is {wid}" for wid in window_ids)
     script = f'''
     tell application "iTerm2"
