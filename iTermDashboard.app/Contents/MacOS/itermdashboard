@@ -7,8 +7,7 @@ import re
 import os
 import time
 import threading
-import random
-import math
+from itertools import permutations
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -703,8 +702,9 @@ def _get_screen_bounds():
 
 def _tile_windows_if_overlapping(window_ids, app="iTerm2"):
     """
-    Moves windows optimally to eliminate overlaps using a Global Stochastic Optimizer.
-    Treats all windows as movable variables to find the true global minimum displacement.
+    Minimum-displacement window tiling via deterministic sequential placement.
+    Tries all permutations (N! — fine for ≤6 windows) to avoid the anchor problem.
+    Accepts the best solution even if minor overlap remains (e.g. 1px off-by-one).
     """
     if len(window_ids) <= 1:
         return
@@ -767,124 +767,150 @@ def _tile_windows_if_overlapping(window_ids, app="iTerm2"):
 
     screen = _get_screen_bounds()
     sx1, sy1, sx2, sy2 = screen
+    # Allow windows to be placed up to MARGIN pixels outside screen to handle
+    # off-by-one sizing issues (e.g. 865+864=1729 on 1728px screen)
+    MARGIN = 4
 
-    def calculate_energy(state):
-        disp = 0
-        overlap = 0
-        wids = list(state.keys())
+    def rect_overlaps(r1, r2):
+        return not (r1[0] + r1[2] <= r2[0] or r1[0] >= r2[0] + r2[2] or
+                    r1[1] + r1[3] <= r2[1] or r1[1] >= r2[1] + r2[3])
 
-        for i in range(len(wids)):
-            w1 = wids[i]
-            x1, y1 = state[w1]
-            ox, oy = orig_positions[w1]
-            disp += (x1 - ox) ** 2 + (y1 - oy) ** 2
+    def total_overlap(positions):
+        """Sum of overlap areas across all pairs."""
+        ov = 0
+        ws = list(positions.keys())
+        for i in range(len(ws)):
+            for j in range(i + 1, len(ws)):
+                ax, ay = positions[ws[i]]
+                aw, ah = sizes[ws[i]]
+                bx, by = positions[ws[j]]
+                bw, bh = sizes[ws[j]]
+                ix = max(0, min(ax + aw, bx + bw) - max(ax, bx))
+                iy = max(0, min(ay + ah, by + bh) - max(ay, by))
+                ov += ix * iy
+        return ov
 
-            for j in range(i + 1, len(wids)):
-                w2 = wids[j]
-                x2, y2 = state[w2]
-                width1, height1 = sizes[w1]
-                width2, height2 = sizes[w2]
+    def solve_order(order):
+        """Place windows sequentially in given order, return (positions, cost)."""
+        placed = []  # list of [x, y, w, h]
+        positions = {}
 
-                ix = max(0, min(x1 + width1, x2 + width2) - max(x1, x2))
-                iy = max(0, min(y1 + height1, y2 + height2) - max(y1, y2))
-
-                if ix > 0 and iy > 0:
-                    overlap += min(ix, iy) ** 2
-
-        return disp, overlap
-
-    n_windows = len(orig_positions)
-    restarts = 100 if n_windows <= 6 else 20
-    steps_per_restart = 800 if n_windows <= 6 else 400
-
-    best_overall_state = None
-    best_overall_disp = float('inf')
-
-    # 2. Basin Hopping / Simulated Annealing
-    for attempt in range(restarts):
-        current_state = {}
-
-        for wid in orig_positions:
-            if attempt == 0:
-                current_state[wid] = list(orig_positions[wid])
-            else:
-                ox, oy = orig_positions[wid]
-                w, h = sizes[wid]
-                nx = ox + random.randint(-200, 200)
-                ny = oy + random.randint(-200, 200)
-                current_state[wid] = [
-                    max(sx1, min(nx, max(sx1, sx2 - w))),
-                    max(sy1, min(ny, max(sy1, sy2 - h)))
-                ]
-
-        curr_disp, curr_overlap = calculate_energy(current_state)
-        temperature = 1000.0
-        cooling_rate = 0.99
-
-        for step in range(steps_per_restart):
-            wid = random.choice(list(current_state.keys()))
-            old_x, old_y = current_state[wid]
+        for wid in order:
+            ox, oy = orig_positions[wid]
             w, h = sizes[wid]
 
-            rand_val = random.random()
-            if rand_val < 0.4:
-                nx = old_x + random.uniform(-30, 30)
-                ny = old_y + random.uniform(-30, 30)
-            elif rand_val < 0.8:
-                snap_proposals = [
-                    (sx1, old_y), (max(sx1, sx2 - w), old_y),
-                    (old_x, sy1), (old_x, max(sy1, sy2 - h))
-                ]
-                for other in current_state:
-                    if other != wid:
-                        oox, ooy = current_state[other]
-                        ow, oh = sizes[other]
-                        snap_proposals.extend([
-                            (oox - w, old_y), (oox + ow, old_y),
-                            (old_x, ooy - h), (old_x, ooy + oh)
-                        ])
-                nx, ny = random.choice(snap_proposals)
-            else:
-                nx, ny = orig_positions[wid]
+            # Generate candidate positions from geometric boundary grid
+            candidates = set()
+            candidates.add((ox, oy))
+            candidates.add((sx1, oy))
+            candidates.add((max(sx1, sx2 - w), oy))
+            candidates.add((ox, sy1))
+            candidates.add((ox, max(sy1, sy2 - h)))
+            # Screen corners
+            candidates.add((sx1, sy1))
+            candidates.add((max(sx1, sx2 - w), sy1))
+            candidates.add((sx1, max(sy1, sy2 - h)))
+            candidates.add((max(sx1, sx2 - w), max(sy1, sy2 - h)))
 
-            nx = max(sx1, min(nx, max(sx1, sx2 - w)))
-            ny = max(sy1, min(ny, max(sy1, sy2 - h)))
+            for px, py, pw, ph in placed:
+                # Adjacent to each placed window
+                candidates.add((px - w, oy))
+                candidates.add((px + pw, oy))
+                candidates.add((ox, py - h))
+                candidates.add((ox, py + ph))
+                # Corners of each placed window
+                candidates.add((px - w, py - h))
+                candidates.add((px + pw, py - h))
+                candidates.add((px - w, py + ph))
+                candidates.add((px + pw, py + ph))
+                # Slide along edges
+                candidates.add((px, oy))
+                candidates.add((ox, py))
+                candidates.add((px + pw - w, oy))
+                candidates.add((ox, py + ph - h))
 
-            current_state[wid] = [nx, ny]
-            new_disp, new_overlap = calculate_energy(current_state)
+            best_pt = None
+            best_dist = float('inf')
 
-            old_energy = curr_disp + 1000000 * curr_overlap
-            new_energy = new_disp + 1000000 * new_overlap
+            for cx, cy in candidates:
+                # Allow MARGIN overflow for off-by-one window sizes
+                if cx < sx1 - MARGIN or cy < sy1 - MARGIN or cx + w > sx2 + MARGIN or cy + h > sy2 + MARGIN:
+                    continue
+                test = [cx, cy, w, h]
+                if any(rect_overlaps(test, p) for p in placed):
+                    continue
+                dist = (cx - ox) ** 2 + (cy - oy) ** 2
+                if dist < best_dist:
+                    best_dist = dist
+                    best_pt = (cx, cy)
 
-            if new_energy < old_energy:
-                curr_disp, curr_overlap = new_disp, new_overlap
-            else:
-                diff = new_energy - old_energy
-                if temperature > 0.01 and math.exp(-diff / max(temperature, 0.001)) > random.random():
-                    curr_disp, curr_overlap = new_disp, new_overlap
-                else:
-                    current_state[wid] = [old_x, old_y]
+            if best_pt is None:
+                # No perfect placement — find position with least overlap
+                best_ov = float('inf')
+                for cx, cy in candidates:
+                    if cx < sx1 - MARGIN or cy < sy1 - MARGIN or cx + w > sx2 + MARGIN or cy + h > sy2 + MARGIN:
+                        continue
+                    test = [cx, cy, w, h]
+                    ov = sum(max(0, min(cx + w, p[0] + p[2]) - max(cx, p[0])) *
+                            max(0, min(cy + h, p[1] + p[3]) - max(cy, p[1]))
+                            for p in placed)
+                    dist = (cx - ox) ** 2 + (cy - oy) ** 2
+                    # Prioritize less overlap, then less distance
+                    score = (ov, dist)
+                    if score < (best_ov, best_dist):
+                        best_ov = ov
+                        best_dist = dist
+                        best_pt = (cx, cy)
 
-            temperature *= cooling_rate
+            if best_pt is None:
+                # Absolute fallback
+                best_pt = (max(sx1, min(ox, sx2 - w)), max(sy1, min(oy, sy2 - h)))
 
-        if curr_overlap == 0 and curr_disp < best_overall_disp:
-            best_overall_disp = curr_disp
-            best_overall_state = {k: list(v) for k, v in current_state.items()}
+            positions[wid] = best_pt
+            placed.append([best_pt[0], best_pt[1], w, h])
 
-    # 3. Apply positions via AppleScript
-    if not best_overall_state:
+        ov = total_overlap(positions)
+        disp = sum((positions[w][0] - orig_positions[w][0]) ** 2 +
+                    (positions[w][1] - orig_positions[w][1]) ** 2
+                    for w in order)
+        return positions, ov, disp
+
+    # 2. Try all permutations (N! — at most 720 for 6 windows)
+    wids = list(orig_positions.keys())
+
+    # For >6 windows, limit to a few heuristic orderings instead of full N!
+    if len(wids) <= 6:
+        orderings = list(permutations(wids))
+    else:
+        orderings = [wids, list(reversed(wids))]
+        orderings.append(sorted(wids, key=lambda w: sizes[w][0] * sizes[w][1], reverse=True))
+        orderings.append(sorted(wids, key=lambda w: orig_positions[w][0]))
+
+    best_positions = None
+    best_score = (float('inf'), float('inf'))  # (overlap, displacement)
+
+    for order in orderings:
+        positions, ov, disp = solve_order(order)
+        score = (ov, disp)
+        if score < best_score:
+            best_score = score
+            best_positions = positions
+
+    if not best_positions:
         return
 
+    # 3. Apply positions via AppleScript (only moved windows)
     set_parts = []
-    for wid, pos in best_overall_state.items():
-        orig_x, orig_y = orig_positions[wid]
+    for wid, (fx, fy) in best_positions.items():
+        ox, oy = orig_positions[wid]
         w, h = sizes[wid]
-        final_x, final_y = int(round(pos[0])), int(round(pos[1]))
-
-        if final_x != orig_x or final_y != orig_y:
+        # Clamp to actual screen bounds for the final position
+        fx = max(sx1, min(int(round(fx)), sx2 - w))
+        fy = max(sy1, min(int(round(fy)), sy2 - h))
+        if fx != ox or fy != oy:
             set_parts.append(f'''
                 if id of w is {wid} then
-                    set bounds of w to {{{final_x}, {final_y}, {final_x + w}, {final_y + h}}}
+                    set bounds of w to {{{fx}, {fy}, {fx + w}, {fy + h}}}
                 end if''')
 
     if set_parts:
