@@ -1662,7 +1662,7 @@ def collect_menu_data(prev_snapshot=None):
         segments = build_session_segments(s, is_last)
         s_tag = tag_counter
         tag_counter += 1
-        session_map[s_tag] = s.window_id
+        session_map[s_tag] = (s.window_id, s.app_source)
         tooltip = f"Path: {s.cwd or '~'}\nProfile: {s.profile}\nSize: {s.columns}x{s.rows}"
         tooltip += f"\nRole: {s.role}\nState: {s.activity_state}"
         if s.fg_command:
