@@ -19,8 +19,13 @@ from AppKit import (
     NSApplicationActivationPolicyAccessory, NSColor,
     NSFontAttributeName, NSForegroundColorAttributeName,
     NSImageSymbolConfiguration,
+    NSWindow, NSScrollView, NSStackView, NSTextField, NSImageView,
+    NSUserInterfaceLayoutOrientationVertical,
+    NSBackingStoreBuffered, NSScreen, NSView,
+    NSTrackingArea,
+    NSVisualEffectView,
 )
-from Foundation import NSDictionary, NSTimer
+from Foundation import NSDictionary, NSTimer, NSMakeRect, NSZeroRect
 
 
 # ── Data Classes ──────────────────────────────────────────────────────────────
@@ -1414,10 +1419,15 @@ def _compute_deltas(prev, curr, sorted_projects, git_statuses):
 def collect_menu_data(prev_snapshot=None):
     """Collect all data. Returns (data, session_map, project_window_map, snapshot)."""
     sessions = get_iterm_sessions()
-    # Also query Nexus if it's running
+    # Also query Nexus if it's running (check first to avoid AppleScript relaunching it)
     try:
-        nexus_sessions = get_nexus_sessions()
-        sessions.extend(nexus_sessions)
+        running = subprocess.run(
+            ["osascript", "-e", 'application "Nexus" is running'],
+            capture_output=True, text=True, timeout=2,
+        )
+        if running.stdout.strip() == "true":
+            nexus_sessions = get_nexus_sessions()
+            sessions.extend(nexus_sessions)
     except Exception:
         pass
     if not sessions:
@@ -1749,10 +1759,225 @@ def collect_menu_data(prev_snapshot=None):
     return data, session_map, project_window_map, snapshot
 
 
+# ── Clickable Row View ────────────────────────────────────────────────────────
+
+class FlippedView(NSView):
+    """An NSView subclass with flipped coordinates (origin at top-left)."""
+    def isFlipped(self):
+        return True
+
+
+class ClickableRow(NSView):
+    """A row view that highlights on hover and fires a callback on click."""
+
+    def initWithFrame_tag_callback_delegate_(self, frame, tag, callback, delegate):
+        self = objc.super(ClickableRow, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self._tag = tag
+        self._callback = callback
+        self._delegate = delegate
+        self._hovered = False
+        tracking = NSTrackingArea.alloc().initWithRect_options_owner_userInfo_(
+            NSZeroRect,
+            0x01 | 0x80 | 0x200,  # mouseEnteredAndExited | activeAlways | inVisibleRect
+            self, None,
+        )
+        self.addTrackingArea_(tracking)
+        return self
+
+    def mouseEntered_(self, event):
+        self._hovered = True
+        self.setNeedsDisplay_(True)
+
+    def mouseExited_(self, event):
+        self._hovered = False
+        self.setNeedsDisplay_(True)
+
+    def drawRect_(self, rect):
+        if self._hovered:
+            NSColor.controlAccentColor().colorWithAlphaComponent_(0.15).set()
+            from AppKit import NSBezierPath
+            NSBezierPath.fillRect_(self.bounds())
+
+    def mouseDown_(self, event):
+        if self._callback and self._delegate:
+            getattr(self._delegate, self._callback)(self)
+
+    def tag(self):
+        return self._tag
+
+
+# ── Sidebar Panel ─────────────────────────────────────────────────────────────
+
+SIDEBAR_WIDTH = 280
+
+def _build_sidebar_row(segments, indent=0, icon=None, tag=0, callback=None,
+                       delegate=None, tooltip=None, is_header=False):
+    """Build a single row view with icon + attributed text."""
+    row_height = 22 if not is_header else 26
+    left_pad = 8 + indent * 14
+
+    if callback and delegate:
+        row = ClickableRow.alloc().initWithFrame_tag_callback_delegate_(
+            NSMakeRect(0, 0, SIDEBAR_WIDTH, row_height), tag, callback, delegate
+        )
+    else:
+        row = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, SIDEBAR_WIDTH, row_height))
+
+    x = left_pad
+
+    if icon:
+        iv = NSImageView.alloc().initWithFrame_(NSMakeRect(x, (row_height - 14) / 2, 14, 14))
+        iv.setImage_(icon)
+        row.addSubview_(iv)
+        x += 18
+
+    label = NSTextField.alloc().initWithFrame_(NSMakeRect(x, 0, SIDEBAR_WIDTH - x - 4, row_height))
+    label.setBezeled_(False)
+    label.setDrawsBackground_(False)
+    label.setEditable_(False)
+    label.setSelectable_(False)
+    label.setAttributedStringValue_(rich_text(segments))
+    if tooltip:
+        label.setToolTip_(tooltip)
+    row.addSubview_(label)
+
+    return row
+
+
+def _build_separator():
+    """Build a thin separator line."""
+    sep = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, SIDEBAR_WIDTH, 8))
+    line = NSView.alloc().initWithFrame_(NSMakeRect(12, 3, SIDEBAR_WIDTH - 24, 1))
+    line.setWantsLayer_(True)
+    line.layer().setBackgroundColor_(NSColor.separatorColor().CGColor())
+    sep.addSubview_(line)
+    return sep
+
+
+def build_sidebar_content(data, delegate):
+    """Build an array of row views from the dashboard data."""
+    rows = []
+
+    if data is None:
+        rows.append(_build_sidebar_row([("Loading...", MONO_SM, CLR_DIM)]))
+        return rows
+
+    # ── Workspaces header ──
+    rows.append(_build_sidebar_row(
+        [("WORKSPACES", BOLD, CLR_LABEL), (f"  ({len(data['projects'])})", MONO_SM, CLR_DIM)],
+        icon=sf_symbol("square.grid.2x2.fill", color=CLR_ACCENT, size=11.0),
+        is_header=True,
+    ))
+    rows.append(_build_separator())
+
+    for proj in data["projects"]:
+        rows.append(_build_sidebar_row(
+            proj["header_segments"],
+            icon=sf_symbol("folder.fill", color=CLR_ACCENT, size=11.0),
+            tag=proj["tag"], callback="projectClicked_", delegate=delegate,
+            tooltip=f"{proj['path']}\n{proj['session_count']} sessions, {proj['claude_count']} Claude",
+            is_header=True,
+        ))
+
+        for sess in proj["sessions"]:
+            if sess.get("type") == "subheader":
+                rows.append(_build_sidebar_row(
+                    [("\u25B8 ", MONO_SM, CLR_DIM), (sess["name"] + "/", BOLD_SM, CLR_ACCENT)],
+                    indent=1,
+                    icon=sf_symbol("folder", color=CLR_DIM, size=10.0),
+                    tag=sess["tag"], callback="projectClicked_", delegate=delegate,
+                ))
+                continue
+
+            indent = 2 if sess.get("in_subgroup") else 1
+            rows.append(_build_sidebar_row(
+                sess["segments"],
+                indent=indent,
+                icon=sf_symbol(
+                    sess.get("icon_name", "apple.terminal.fill"),
+                    color=sess.get("icon_color", CLR_SECONDARY),
+                    size=10.0,
+                ),
+                tag=sess["tag"], callback="sessionClicked_", delegate=delegate,
+                tooltip=sess.get("tooltip"),
+            ))
+
+        rows.append(_build_separator())
+
+    # ── Unassigned ──
+    if data.get("unassigned"):
+        rows.append(_build_sidebar_row(
+            [("GLOBAL", BOLD, CLR_LABEL), ("  / UNASSIGNED", MONO_SM, CLR_DIM)],
+            icon=sf_symbol("globe", color=CLR_SECONDARY, size=11.0),
+            is_header=True,
+        ))
+        for sess in data["unassigned"]:
+            rows.append(_build_sidebar_row(
+                sess["segments"],
+                indent=1,
+                icon=sf_symbol(
+                    sess.get("icon_name", "apple.terminal.fill"),
+                    color=sess.get("icon_color", CLR_SECONDARY),
+                    size=10.0,
+                ),
+                tag=sess["tag"], callback="sessionClicked_", delegate=delegate,
+                tooltip=sess.get("tooltip"),
+            ))
+        rows.append(_build_separator())
+
+    # ── Changes ──
+    if data.get("deltas"):
+        rows.append(_build_sidebar_row(
+            [("CHANGES", BOLD, CLR_LABEL)],
+            icon=sf_symbol("arrow.triangle.2.circlepath", color=CLR_CYAN, size=11.0),
+            is_header=True,
+        ))
+        for line in data["deltas"]:
+            if line.startswith("[+]"):
+                clr = CLR_GREEN
+                ico = sf_symbol("plus.circle.fill", color=CLR_GREEN, size=9.0)
+            elif line.startswith("[-]"):
+                clr = CLR_ORANGE
+                ico = sf_symbol("minus.circle.fill", color=CLR_ORANGE, size=9.0)
+            else:
+                clr = CLR_CYAN
+                ico = sf_symbol("arrow.right.circle.fill", color=CLR_CYAN, size=9.0)
+            rows.append(_build_sidebar_row(
+                [(line[:3], BOLD_SM, clr), (line[3:], MONO_SM, CLR_SECONDARY)],
+                indent=1, icon=ico,
+            ))
+        rows.append(_build_separator())
+
+    # ── Insights ──
+    rows.append(_build_sidebar_row(
+        [("SYSTEM INSIGHTS", BOLD, CLR_LABEL)],
+        icon=sf_symbol("chart.bar.fill", color=CLR_ORANGE, size=11.0),
+        is_header=True,
+    ))
+    for line in data.get("insights", []):
+        segments = build_insight_segments(line)
+        if line.startswith("[!]"):
+            ico = sf_symbol("exclamationmark.triangle.fill", color=CLR_ORANGE, size=9.0)
+        else:
+            ico = sf_symbol("info.circle.fill", color=CLR_CYAN, size=9.0)
+        rows.append(_build_sidebar_row(segments, indent=1, icon=ico))
+
+    # ── Summary ──
+    rows.append(_build_separator())
+    rows.append(_build_sidebar_row(data.get("summary_segments", []), indent=0))
+
+    return rows
+
+
 # ── App Delegate ──────────────────────────────────────────────────────────────
 
 class AppDelegate(NSObject):
     _status_item = objc.ivar()
+    _sidebar_window = objc.ivar()
+    _sidebar_scroll = objc.ivar()
+    _sidebar_container = objc.ivar()
     _cached_data = objc.ivar()
     _session_map = objc.ivar()
     _project_window_map = objc.ivar()
@@ -1783,11 +2008,87 @@ class AppDelegate(NSObject):
         menu.setDelegate_(self)
         self._status_item.setMenu_(menu)
 
+        # ── Create sidebar window ──
+        self._create_sidebar()
+
         self._start_refresh()
 
         self._refresh_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             30.0, self, "timerRefresh:", None, True
         )
+
+    def _create_sidebar(self):
+        screen = NSScreen.mainScreen().frame()
+        # Full screen height, left side
+        win_rect = NSMakeRect(0, 0, SIDEBAR_WIDTH, screen.size.height)
+
+        style = (1 | 2 | 8 | (1 << 15))  # titled | closable | resizable | fullSizeContentView
+        win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            win_rect, style, NSBackingStoreBuffered, False
+        )
+        win.setTitle_("Workspaces")
+        win.setTitlebarAppearsTransparent_(True)
+        win.setTitleVisibility_(1)  # NSWindowTitleHidden
+        win.setLevel_(3)  # NSFloatingWindowLevel
+        win.setCollectionBehavior_(
+            (1 << 0) | (1 << 4)  # canJoinAllSpaces | stationary
+        )
+        win.setHasShadow_(True)
+        win.setOpaque_(False)
+        win.setBackgroundColor_(NSColor.clearColor())
+
+        # Vibrancy background (sidebar material)
+        effect_view = NSVisualEffectView.alloc().initWithFrame_(win_rect)
+        effect_view.setMaterial_(7)  # NSVisualEffectMaterialSidebar
+        effect_view.setBlendingMode_(0)  # NSVisualEffectBlendingModeBehindWindow
+        effect_view.setState_(1)  # NSVisualEffectStateActive
+        effect_view.setAutoresizingMask_(18)  # width + height flexible
+        win.contentView().addSubview_positioned_relativeTo_(effect_view, -1, None)  # behind
+
+        # Scroll view with flipped document view so content starts at top
+        scroll = NSScrollView.alloc().initWithFrame_(win.contentView().bounds())
+        scroll.setHasVerticalScroller_(True)
+        scroll.setHasHorizontalScroller_(False)
+        scroll.setAutoresizingMask_(18)
+        scroll.setDrawsBackground_(False)
+
+        # Use a flipped container as document view so (0,0) is top-left
+        container = FlippedView.alloc().initWithFrame_(NSMakeRect(0, 0, SIDEBAR_WIDTH, 0))
+        scroll.setDocumentView_(container)
+
+        win.contentView().addSubview_(scroll)
+
+        win.orderFront_(None)
+        self._sidebar_window = win
+        self._sidebar_scroll = scroll
+        self._sidebar_container = container
+
+    def _updateSidebar(self):
+        with self._lock:
+            data = self._cached_data
+
+        container = self._sidebar_container
+        if container is None:
+            return
+
+        # Remove all existing subviews
+        for view in list(container.subviews()):
+            view.removeFromSuperview()
+
+        # Build new rows and lay them out top-to-bottom
+        rows = build_sidebar_content(data, self)
+        y = 4  # top padding
+        width = max(SIDEBAR_WIDTH, int(self._sidebar_scroll.contentView().bounds().size.width))
+        for row in rows:
+            # Get the row's intrinsic height from its constraint or frame
+            h = int(row.frame().size.height) or 22
+            row.setFrame_(NSMakeRect(0, y, width, h))
+            row.setTranslatesAutoresizingMaskIntoConstraints_(True)
+            container.addSubview_(row)
+            y += h
+
+        # Resize container to fit all content
+        container.setFrameSize_((width, y + 4))
 
     def timerRefresh_(self, timer):
         self._start_refresh()
@@ -1806,7 +2107,11 @@ class AppDelegate(NSObject):
             self._project_window_map = project_window_map
             if snapshot is not None:
                 self._prev_snapshot = snapshot
-        self.performSelectorOnMainThread_withObject_waitUntilDone_("_updateMenu", None, False)
+        self.performSelectorOnMainThread_withObject_waitUntilDone_("_updateUI", None, False)
+
+    def _updateUI(self):
+        self._updateMenu()
+        self._updateSidebar()
 
     def _updateMenu(self):
         with self._lock:
