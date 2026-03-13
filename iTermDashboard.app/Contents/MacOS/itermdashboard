@@ -1767,7 +1767,7 @@ class FlippedView(NSView):
         return True
 
 
-class ClickableRow(NSView):
+class ClickableRow(FlippedView):
     """A row view that highlights on hover and fires a callback on click."""
 
     def initWithFrame_tag_callback_delegate_(self, frame, tag, callback, delegate):
@@ -1823,25 +1823,38 @@ def _build_sidebar_row(segments, indent=0, icon=None, tag=0, callback=None,
             NSMakeRect(0, 0, SIDEBAR_WIDTH, row_height), tag, callback, delegate
         )
     else:
-        row = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, SIDEBAR_WIDTH, row_height))
+        row = FlippedView.alloc().initWithFrame_(NSMakeRect(0, 0, SIDEBAR_WIDTH, row_height))
 
     x = left_pad
+    icon_x = x
 
     if icon:
-        iv = NSImageView.alloc().initWithFrame_(NSMakeRect(x, (row_height - 14) / 2, 14, 14))
-        iv.setImage_(icon)
-        row.addSubview_(iv)
         x += 18
 
+    # Create label first so we can measure its natural height
     label = NSTextField.alloc().initWithFrame_(NSMakeRect(x, 0, SIDEBAR_WIDTH - x - 4, row_height))
     label.setBezeled_(False)
     label.setDrawsBackground_(False)
     label.setEditable_(False)
     label.setSelectable_(False)
     label.setAttributedStringValue_(rich_text(segments))
+    label.sizeToFit()
+    # Center the label vertically in the row
+    label_h = label.frame().size.height
+    label_y = round((row_height - label_h) / 2.0)
+    label.setFrame_(NSMakeRect(x, label_y, SIDEBAR_WIDTH - x - 4, label_h))
     if tooltip:
         label.setToolTip_(tooltip)
     row.addSubview_(label)
+
+    if icon:
+        icon_size = 14
+        # Align icon center with label center
+        label_center = label_y + label_h / 2.0
+        icon_y = round(label_center - icon_size / 2.0)
+        iv = NSImageView.alloc().initWithFrame_(NSMakeRect(icon_x, icon_y, icon_size, icon_size))
+        iv.setImage_(icon)
+        row.addSubview_(iv)
 
     return row
 
