@@ -19,13 +19,17 @@ from AppKit import (
     NSApplicationActivationPolicyAccessory, NSColor,
     NSFontAttributeName, NSForegroundColorAttributeName,
     NSImageSymbolConfiguration,
-    NSWindow, NSScrollView, NSStackView, NSTextField, NSImageView,
+    NSWindow, NSPanel, NSScrollView, NSStackView, NSTextField, NSImageView,
     NSUserInterfaceLayoutOrientationVertical,
     NSBackingStoreBuffered, NSScreen, NSView,
     NSTrackingArea,
     NSVisualEffectView,
+    NSWorkspace, NSAnimationContext, NSEvent,
 )
-from Foundation import NSDictionary, NSTimer, NSMakeRect, NSZeroRect
+from Foundation import (
+    NSDictionary, NSTimer, NSMakeRect, NSZeroRect,
+    NSNotificationCenter,
+)
 
 
 # ── Data Classes ──────────────────────────────────────────────────────────────
@@ -1811,6 +1815,18 @@ class ClickableRow(FlippedView):
 # ── Sidebar Panel ─────────────────────────────────────────────────────────────
 
 SIDEBAR_WIDTH = 280
+SIDEBAR_COLLAPSED_WIDTH = 8   # invisible hit zone width
+SIDEBAR_STRIP_WIDTH = 2       # visible accent strip
+SIDEBAR_HOVER_DELAY = 0.1     # seconds before expand
+SIDEBAR_EXIT_DELAY = 0.3      # seconds before collapse
+SIDEBAR_ANIM_DURATION = 0.15  # slide animation duration
+
+TERMINAL_BUNDLE_IDS = {
+    "com.googlecode.iterm2",
+    "com.nexus.terminal",
+}
+
+
 
 def _build_sidebar_row(segments, indent=0, icon=None, tag=0, callback=None,
                        delegate=None, tooltip=None, is_header=False):
@@ -1986,11 +2002,27 @@ def build_sidebar_content(data, delegate):
 
 # ── App Delegate ──────────────────────────────────────────────────────────────
 
+def _any_terminal_running():
+    """Check if any tracked terminal app is currently running."""
+    for app in NSWorkspace.sharedWorkspace().runningApplications():
+        bid = app.bundleIdentifier()
+        if bid and bid in TERMINAL_BUNDLE_IDS:
+            return True
+    return False
+
+
 class AppDelegate(NSObject):
     _status_item = objc.ivar()
     _sidebar_window = objc.ivar()
     _sidebar_scroll = objc.ivar()
     _sidebar_container = objc.ivar()
+    _sidebar_effect_view = objc.ivar()
+    _sidebar_strip = objc.ivar()
+    _sidebar_expanded = objc.ivar()
+    _sidebar_visible = objc.ivar()
+    _hover_enter_time = objc.ivar()
+    _hover_exit_time = objc.ivar()
+    _mouse_poll_timer = objc.ivar()
     _cached_data = objc.ivar()
     _session_map = objc.ivar()
     _project_window_map = objc.ivar()
@@ -2006,6 +2038,10 @@ class AppDelegate(NSObject):
         self._project_window_map = {}
         self._prev_snapshot = None
         self._lock = threading.Lock()
+        self._sidebar_expanded = False
+        self._sidebar_visible = False
+        self._hover_enter_time = None
+        self._hover_exit_time = None
 
         status_bar = NSStatusBar.systemStatusBar()
         self._status_item = status_bar.statusItemWithLength_(NSVariableStatusItemLength)
@@ -2024,54 +2060,91 @@ class AppDelegate(NSObject):
         # ── Create sidebar window ──
         self._create_sidebar()
 
+        # ── Workspace observers for app launch/quit ──
+        ws = NSWorkspace.sharedWorkspace()
+        nc = ws.notificationCenter()
+        nc.addObserver_selector_name_object_(
+            self, "_appLaunched:", "NSWorkspaceDidLaunchApplicationNotification", None,
+        )
+        nc.addObserver_selector_name_object_(
+            self, "_appTerminated:", "NSWorkspaceDidTerminateApplicationNotification", None,
+        )
+        nc.addObserver_selector_name_object_(
+            self, "_spaceChanged:", "NSWorkspaceActiveSpaceDidChangeNotification", None,
+        )
+
+        # Initial visibility check
+        if _any_terminal_running():
+            self._show_sidebar()
+        else:
+            self._hide_sidebar()
+
         self._start_refresh()
 
         self._refresh_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
             30.0, self, "timerRefresh:", None, True
         )
 
+        # Mouse position poll for auto-hide (NSTrackingArea doesn't work for accessory apps)
+        self._mouse_poll_timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            0.05, self, "_pollMouse:", None, True
+        )
+
     def _create_sidebar(self):
         screen = NSScreen.mainScreen().frame()
-        # Full screen height, left side
-        win_rect = NSMakeRect(0, 0, SIDEBAR_WIDTH, screen.size.height)
+        # Start collapsed: 8px hit zone on left edge
+        win_rect = NSMakeRect(0, 0, SIDEBAR_COLLAPSED_WIDTH, screen.size.height)
 
-        style = 0  # borderless — no title bar or traffic lights
+        # NSPanel with nonactivating mask — won't steal focus from terminals
+        style = 0  # borderless
         win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            win_rect, style, NSBackingStoreBuffered, False
+            win_rect, style, NSBackingStoreBuffered, False,
         )
         win.setLevel_(3)  # NSFloatingWindowLevel
         win.setCollectionBehavior_(
             (1 << 0) | (1 << 4)  # canJoinAllSpaces | stationary
         )
-        win.setHasShadow_(True)
+        win.setHasShadow_(False)
         win.setOpaque_(False)
         win.setBackgroundColor_(NSColor.clearColor())
+        win.setHidesOnDeactivate_(False)
 
-        # Vibrancy background (sidebar material)
-        effect_view = NSVisualEffectView.alloc().initWithFrame_(win_rect)
+        content = win.contentView()
+        full_rect = NSMakeRect(0, 0, SIDEBAR_WIDTH, screen.size.height)
+
+        # ── Accent strip (visible when collapsed) ──
+        strip = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, SIDEBAR_STRIP_WIDTH, screen.size.height))
+        strip.setWantsLayer_(True)
+        strip.layer().setBackgroundColor_(NSColor.controlAccentColor().colorWithAlphaComponent_(0.8).CGColor())
+        strip.setAutoresizingMask_(16)  # height flexible
+        content.addSubview_(strip)
+        self._sidebar_strip = strip
+
+        # ── Vibrancy background (hidden when collapsed) ──
+        effect_view = NSVisualEffectView.alloc().initWithFrame_(full_rect)
         effect_view.setMaterial_(7)  # NSVisualEffectMaterialSidebar
-        effect_view.setBlendingMode_(0)  # NSVisualEffectBlendingModeBehindWindow
-        effect_view.setState_(1)  # NSVisualEffectStateActive
+        effect_view.setBlendingMode_(0)  # behindWindow
+        effect_view.setState_(1)  # active
         effect_view.setAutoresizingMask_(18)  # width + height flexible
-        win.contentView().addSubview_positioned_relativeTo_(effect_view, -1, None)  # behind
+        effect_view.setHidden_(True)
+        content.addSubview_(effect_view)
 
-        # Scroll view with flipped document view so content starts at top
-        scroll = NSScrollView.alloc().initWithFrame_(win.contentView().bounds())
+        # ── Scroll view with content (hidden when collapsed) ──
+        scroll = NSScrollView.alloc().initWithFrame_(full_rect)
         scroll.setHasVerticalScroller_(True)
         scroll.setHasHorizontalScroller_(False)
         scroll.setAutoresizingMask_(18)
         scroll.setDrawsBackground_(False)
+        scroll.setHidden_(True)
 
-        # Use a flipped container as document view so (0,0) is top-left
         container = FlippedView.alloc().initWithFrame_(NSMakeRect(0, 0, SIDEBAR_WIDTH, 0))
         scroll.setDocumentView_(container)
+        content.addSubview_(scroll)
 
-        win.contentView().addSubview_(scroll)
-
-        win.orderFront_(None)
         self._sidebar_window = win
         self._sidebar_scroll = scroll
         self._sidebar_container = container
+        self._sidebar_effect_view = effect_view
 
     def _updateSidebar(self):
         with self._lock:
@@ -2099,6 +2172,126 @@ class AppDelegate(NSObject):
 
         # Resize container to fit all content
         container.setFrameSize_((width, y + 4))
+
+    # ── Auto-hide: expand / collapse ──
+
+    # ── Auto-hide: poll mouse position ──
+    # NSTrackingArea doesn't work for accessory-policy borderless windows,
+    # so we poll at 50ms (like macOS Dock does internally).
+
+    def _pollMouse_(self, timer):
+        """Check mouse position and expand/collapse sidebar accordingly."""
+        if not self._sidebar_visible:
+            return
+
+        mouse = NSEvent.mouseLocation()
+        win = self._sidebar_window
+        frame = win.frame()
+
+        # Check if mouse is inside the current window frame
+        in_zone = (mouse.x <= frame.size.width
+                   and mouse.y >= frame.origin.y
+                   and mouse.y <= frame.origin.y + frame.size.height)
+
+        if in_zone and not self._sidebar_expanded:
+            # Hover delay: require mouse to stay in zone
+            now = time.monotonic()
+            if self._hover_enter_time is None:
+                self._hover_enter_time = now
+            elif now - self._hover_enter_time >= SIDEBAR_HOVER_DELAY:
+                self._expandSidebar()
+        elif not in_zone:
+            self._hover_enter_time = None
+            if self._sidebar_expanded:
+                now = time.monotonic()
+                if self._hover_exit_time is None:
+                    self._hover_exit_time = now
+                elif now - self._hover_exit_time >= SIDEBAR_EXIT_DELAY:
+                    self._collapseSidebar()
+            else:
+                self._hover_exit_time = None
+
+        if in_zone:
+            self._hover_exit_time = None
+
+    def _expandSidebar(self):
+        """Animate sidebar to full width."""
+        self._sidebar_expanded = True
+        win = self._sidebar_window
+        screen = NSScreen.mainScreen().frame()
+
+        # Show content views, hide strip
+        self._sidebar_effect_view.setHidden_(False)
+        self._sidebar_scroll.setHidden_(False)
+        self._sidebar_strip.setHidden_(True)
+
+        NSAnimationContext.beginGrouping()
+        NSAnimationContext.currentContext().setDuration_(SIDEBAR_ANIM_DURATION)
+        win.animator().setFrame_display_(NSMakeRect(0, 0, SIDEBAR_WIDTH, screen.size.height), True)
+        NSAnimationContext.endGrouping()
+
+        win.setHasShadow_(True)
+
+    def _collapseSidebar(self):
+        """Animate sidebar back to collapsed strip."""
+        self._sidebar_expanded = False
+        win = self._sidebar_window
+        screen = NSScreen.mainScreen().frame()
+
+        win.setHasShadow_(False)
+        effect_view = self._sidebar_effect_view
+        scroll_view = self._sidebar_scroll
+        strip = self._sidebar_strip
+
+        def completion_handler():
+            if not self._sidebar_expanded:
+                effect_view.setHidden_(True)
+                scroll_view.setHidden_(True)
+                strip.setHidden_(False)
+
+        NSAnimationContext.beginGrouping()
+        ctx = NSAnimationContext.currentContext()
+        ctx.setDuration_(SIDEBAR_ANIM_DURATION)
+        ctx.setCompletionHandler_(completion_handler)
+        win.animator().setFrame_display_(NSMakeRect(0, 0, SIDEBAR_COLLAPSED_WIDTH, screen.size.height), True)
+        NSAnimationContext.endGrouping()
+
+    # ── App tracking: show/hide based on running terminals ──
+
+    def _show_sidebar(self):
+        """Show the collapsed sidebar strip."""
+        if self._sidebar_visible:
+            return
+        self._sidebar_visible = True
+        self._sidebar_window.orderFront_(None)
+
+    def _hide_sidebar(self):
+        """Hide sidebar entirely (no terminal apps running)."""
+        self._sidebar_visible = False
+        self._sidebar_expanded = False
+        self._sidebar_window.orderOut_(None)
+
+    def _appLaunched_(self, notification):
+        app = notification.userInfo()["NSWorkspaceApplicationKey"]
+        bid = app.bundleIdentifier()
+        if bid and bid in TERMINAL_BUNDLE_IDS:
+            self._show_sidebar()
+            self._start_refresh()
+
+    def _appTerminated_(self, notification):
+        app = notification.userInfo()["NSWorkspaceApplicationKey"]
+        bid = app.bundleIdentifier()
+        if bid and bid in TERMINAL_BUNDLE_IDS:
+            # Check if any other terminal is still running
+            if not _any_terminal_running():
+                self._hide_sidebar()
+
+    def _spaceChanged_(self, notification):
+        """Re-evaluate sidebar visibility on space change."""
+        if _any_terminal_running():
+            self._show_sidebar()
+        else:
+            self._hide_sidebar()
 
     def timerRefresh_(self, timer):
         self._start_refresh()
