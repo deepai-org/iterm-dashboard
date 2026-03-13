@@ -2035,13 +2035,10 @@ class AppDelegate(NSObject):
         # Full screen height, left side
         win_rect = NSMakeRect(0, 0, SIDEBAR_WIDTH, screen.size.height)
 
-        style = (1 | 2 | 8 | (1 << 15))  # titled | closable | resizable | fullSizeContentView
+        style = 0  # borderless — no title bar or traffic lights
         win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             win_rect, style, NSBackingStoreBuffered, False
         )
-        win.setTitle_("Workspaces")
-        win.setTitlebarAppearsTransparent_(True)
-        win.setTitleVisibility_(1)  # NSWindowTitleHidden
         win.setLevel_(3)  # NSFloatingWindowLevel
         win.setCollectionBehavior_(
             (1 << 0) | (1 << 4)  # canJoinAllSpaces | stationary
