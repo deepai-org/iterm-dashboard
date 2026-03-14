@@ -2016,7 +2016,6 @@ class AppDelegate(NSObject):
     _sidebar_window = objc.ivar()
     _sidebar_scroll = objc.ivar()
     _sidebar_container = objc.ivar()
-    _sidebar_effect_view = objc.ivar()
     _sidebar_strip = objc.ivar()
     _sidebar_expanded = objc.ivar()
     _sidebar_visible = objc.ivar()
@@ -2091,9 +2090,9 @@ class AppDelegate(NSObject):
         )
 
     def _create_sidebar(self):
-        screen = NSScreen.mainScreen().frame()
+        screen = NSScreen.mainScreen().visibleFrame()
         # Start collapsed: 8px hit zone on left edge
-        win_rect = NSMakeRect(0, 0, SIDEBAR_COLLAPSED_WIDTH, screen.size.height)
+        win_rect = NSMakeRect(screen.origin.x, screen.origin.y, SIDEBAR_COLLAPSED_WIDTH, screen.size.height)
 
         # NSPanel with nonactivating mask — won't steal focus from terminals
         style = 0 | (1 << 7)  # borderless | NSWindowStyleMaskNonactivatingPanel
@@ -2122,22 +2121,21 @@ class AppDelegate(NSObject):
         content.addSubview_(strip)
         self._sidebar_strip = strip
 
-        # ── Vibrancy background (hidden when collapsed) ──
+        # ── Vibrancy background (always present, clipped by window width) ──
         effect_view = NSVisualEffectView.alloc().initWithFrame_(full_rect)
         effect_view.setMaterial_(7)  # NSVisualEffectMaterialSidebar
         effect_view.setBlendingMode_(0)  # behindWindow
         effect_view.setState_(1)  # active
         effect_view.setAutoresizingMask_(18)  # width + height flexible
-        effect_view.setHidden_(True)
         content.addSubview_(effect_view)
 
-        # ── Scroll view with content (hidden when collapsed) ──
+        # ── Scroll view with content (always present, clipped by window width) ──
         scroll = NSScrollView.alloc().initWithFrame_(full_rect)
         scroll.setHasVerticalScroller_(True)
         scroll.setHasHorizontalScroller_(False)
         scroll.setAutoresizingMask_(18)
         scroll.setDrawsBackground_(False)
-        scroll.setHidden_(True)
+        scroll.setAutomaticallyAdjustsContentInsets_(False)
 
         container = FlippedView.alloc().initWithFrame_(NSMakeRect(0, 0, SIDEBAR_WIDTH, 0))
         scroll.setDocumentView_(container)
@@ -2146,7 +2144,6 @@ class AppDelegate(NSObject):
         self._sidebar_window = win
         self._sidebar_scroll = scroll
         self._sidebar_container = container
-        self._sidebar_effect_view = effect_view
 
     def _updateSidebar(self):
         with self._lock:
@@ -2174,6 +2171,9 @@ class AppDelegate(NSObject):
 
         # Resize container to fit all content
         container.setFrameSize_((width, y + 4))
+        # Scroll to top
+        self._sidebar_scroll.contentView().scrollToPoint_((0, 0))
+        self._sidebar_scroll.reflectScrolledClipView_(self._sidebar_scroll.contentView())
 
     # ── Auto-hide: expand / collapse ──
 
@@ -2217,16 +2217,13 @@ class AppDelegate(NSObject):
         """Animate sidebar to full width."""
         self._sidebar_expanded = True
         win = self._sidebar_window
-        screen = NSScreen.mainScreen().frame()
+        screen = NSScreen.mainScreen().visibleFrame()
 
-        # Show content views, hide strip
-        self._sidebar_effect_view.setHidden_(False)
-        self._sidebar_scroll.setHidden_(False)
         self._sidebar_strip.setHidden_(True)
 
         NSAnimationContext.beginGrouping()
         NSAnimationContext.currentContext().setDuration_(SIDEBAR_ANIM_DURATION)
-        win.animator().setFrame_display_(NSMakeRect(0, 0, SIDEBAR_WIDTH, screen.size.height), True)
+        win.animator().setFrame_display_(NSMakeRect(screen.origin.x, screen.origin.y, SIDEBAR_WIDTH, screen.size.height), True)
         NSAnimationContext.endGrouping()
 
         win.setHasShadow_(True)
@@ -2235,24 +2232,20 @@ class AppDelegate(NSObject):
         """Animate sidebar back to collapsed strip."""
         self._sidebar_expanded = False
         win = self._sidebar_window
-        screen = NSScreen.mainScreen().frame()
+        screen = NSScreen.mainScreen().visibleFrame()
 
         win.setHasShadow_(False)
-        effect_view = self._sidebar_effect_view
-        scroll_view = self._sidebar_scroll
         strip = self._sidebar_strip
 
         def completion_handler():
             if not self._sidebar_expanded:
-                effect_view.setHidden_(True)
-                scroll_view.setHidden_(True)
                 strip.setHidden_(False)
 
         NSAnimationContext.beginGrouping()
         ctx = NSAnimationContext.currentContext()
         ctx.setDuration_(SIDEBAR_ANIM_DURATION)
         ctx.setCompletionHandler_(completion_handler)
-        win.animator().setFrame_display_(NSMakeRect(0, 0, SIDEBAR_COLLAPSED_WIDTH, screen.size.height), True)
+        win.animator().setFrame_display_(NSMakeRect(screen.origin.x, screen.origin.y, SIDEBAR_COLLAPSED_WIDTH, screen.size.height), True)
         NSAnimationContext.endGrouping()
 
     # ── App tracking: show/hide based on running terminals ──
