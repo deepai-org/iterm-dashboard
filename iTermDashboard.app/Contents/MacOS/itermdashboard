@@ -999,7 +999,9 @@ return
 end if
 end repeat
 end tell'''
-        run_osascript(script)
+        result = run_osascript(script)
+        if result == "" and proj_basename:
+            _clog("PyCharm AXRaise may have failed for '%s' — check Accessibility permissions" % proj_basename)
     else:
         subprocess.run(["open", "-b", bundle_id], capture_output=True, timeout=5)
 
@@ -2107,6 +2109,9 @@ def build_sidebar_content(data, delegate):
     """Build an array of row views from the dashboard data."""
     rows = []
 
+    delegate._companion_map = {}
+    delegate._next_companion_tag = 10000
+
     if data is None:
         rows.append(_build_sidebar_row([("Loading...", MONO_SM, CLR_DIM)]))
         return rows
@@ -2153,7 +2158,8 @@ def build_sidebar_content(data, delegate):
                     btn.setToolTip_(app_name)
                     btn.setTarget_(delegate)
                     btn.setAction_(objc.selector(delegate.companionClicked_, signature=b'v@:@'))
-                    c_tag = proj["tag"] * 100 + hash(app_name) % 97
+                    c_tag = delegate._next_companion_tag
+                    delegate._next_companion_tag += 1
                     btn.setTag_(c_tag)
                     delegate._companion_map[c_tag] = (info["bundle"], app_name, proj["path"])
                     row.addSubview_(btn)
@@ -2275,6 +2281,7 @@ class AppDelegate(NSObject):
     _session_map = objc.ivar()
     _project_window_map = objc.ivar()
     _companion_map = objc.ivar()
+    _next_companion_tag = objc.ivar()
     _prev_snapshot = objc.ivar()
     _lock = objc.ivar()
     _refresh_timer = objc.ivar()
@@ -2286,6 +2293,7 @@ class AppDelegate(NSObject):
         self._session_map = {}
         self._project_window_map = {}
         self._companion_map = {}
+        self._next_companion_tag = 10000
         self._prev_snapshot = None
         self._lock = threading.Lock()
         self._sidebar_expanded = False
