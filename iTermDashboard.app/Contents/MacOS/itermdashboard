@@ -2113,21 +2113,15 @@ class AppDelegate(NSObject):
         content = win.contentView()
         full_rect = NSMakeRect(0, 0, SIDEBAR_WIDTH, screen.size.height)
 
-        # ── Accent strip (visible when collapsed) ──
-        strip = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, SIDEBAR_STRIP_WIDTH, screen.size.height))
-        strip.setWantsLayer_(True)
-        strip.layer().setBackgroundColor_(NSColor.controlAccentColor().colorWithAlphaComponent_(0.8).CGColor())
-        strip.setAutoresizingMask_(16)  # height flexible
-        content.addSubview_(strip)
-        self._sidebar_strip = strip
-
-        # ── Vibrancy background (always present, clipped by window width) ──
+        # ── Vibrancy background (hidden when collapsed to avoid blue bleed) ──
         effect_view = NSVisualEffectView.alloc().initWithFrame_(full_rect)
         effect_view.setMaterial_(7)  # NSVisualEffectMaterialSidebar
         effect_view.setBlendingMode_(0)  # behindWindow
         effect_view.setState_(1)  # active
         effect_view.setAutoresizingMask_(18)  # width + height flexible
+        effect_view.setHidden_(True)
         content.addSubview_(effect_view)
+        self._sidebar_effect_view = effect_view
 
         # ── Scroll view with content (always present, clipped by window width) ──
         scroll = NSScrollView.alloc().initWithFrame_(full_rect)
@@ -2140,6 +2134,14 @@ class AppDelegate(NSObject):
         container = FlippedView.alloc().initWithFrame_(NSMakeRect(0, 0, SIDEBAR_WIDTH, 0))
         scroll.setDocumentView_(container)
         content.addSubview_(scroll)
+
+        # ── Accent strip (topmost — 2px accent, visible when collapsed) ──
+        strip = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, SIDEBAR_STRIP_WIDTH, screen.size.height))
+        strip.setWantsLayer_(True)
+        strip.layer().setBackgroundColor_(NSColor.controlAccentColor().colorWithAlphaComponent_(0.8).CGColor())
+        strip.setAutoresizingMask_(16)  # height flexible
+        content.addSubview_(strip)
+        self._sidebar_strip = strip
 
         self._sidebar_window = win
         self._sidebar_scroll = scroll
@@ -2220,6 +2222,7 @@ class AppDelegate(NSObject):
         screen = NSScreen.mainScreen().visibleFrame()
 
         self._sidebar_strip.setHidden_(True)
+        self._sidebar_effect_view.setHidden_(False)
 
         NSAnimationContext.beginGrouping()
         NSAnimationContext.currentContext().setDuration_(SIDEBAR_ANIM_DURATION)
@@ -2237,9 +2240,12 @@ class AppDelegate(NSObject):
         win.setHasShadow_(False)
         strip = self._sidebar_strip
 
+        effect_view = self._sidebar_effect_view
+
         def completion_handler():
             if not self._sidebar_expanded:
                 strip.setHidden_(False)
+                effect_view.setHidden_(True)
 
         NSAnimationContext.beginGrouping()
         ctx = NSAnimationContext.currentContext()
