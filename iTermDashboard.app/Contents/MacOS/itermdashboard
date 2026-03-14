@@ -19,7 +19,7 @@ from AppKit import (
     NSApplicationActivationPolicyAccessory, NSColor,
     NSFontAttributeName, NSForegroundColorAttributeName,
     NSImageSymbolConfiguration,
-    NSWindow, NSPanel, NSScrollView, NSStackView, NSTextField, NSImageView,
+    NSWindow, NSPanel, NSScrollView, NSStackView, NSTextField, NSImageView, NSButton,
     NSUserInterfaceLayoutOrientationVertical,
     NSBackingStoreBuffered, NSScreen, NSView,
     NSTrackingArea,
@@ -949,6 +949,61 @@ def raise_app_windows(window_ids, app="iTerm2"):
     run_osascript(script)
 
 
+def _raise_companion_app(bundle_id, app_name, proj_path):
+    """Activate companion app and try to raise the window matching the project."""
+    # Convert POSIX proj_path to HFS-style suffix for matching
+    # e.g. /Users/kevin/Desktop/poly -> :Users:kevin:Desktop:poly:
+    hfs_suffix = ":" + proj_path.lstrip("/").replace("/", ":") + ":"
+    if app_name == "BBEdit":
+        # Find a document whose HFS path contains the project directory
+        script = f'''tell application "BBEdit"
+activate
+set dl to every text document
+repeat with i from 1 to count of dl
+try
+set f to file of (item i of dl)
+if (f as text) contains "{hfs_suffix}" then
+tell (item i of dl) to select
+return
+end if
+end try
+end repeat
+end tell'''
+        run_osascript(script)
+    elif app_name == "Finder":
+        # Activate Finder and raise the window showing this path
+        script = f'''tell application "Finder"
+activate
+set n to count of Finder windows
+repeat with i from 1 to n
+try
+set p to POSIX path of (target of Finder window i as alias)
+if p starts with "{proj_path}" then
+set index of Finder window i to 1
+return
+end if
+end try
+end repeat
+end tell'''
+        run_osascript(script)
+    elif app_name == "PyCharm":
+        # PyCharm window titles start with project name — raise the matching window
+        proj_basename = os.path.basename(proj_path)
+        script = f'''tell application "System Events"
+set p to first process whose bundle identifier is "{bundle_id}"
+set frontmost of p to true
+repeat with w in every window of p
+if name of w starts with "{proj_basename}" then
+perform action "AXRaise" of w
+return
+end if
+end repeat
+end tell'''
+        run_osascript(script)
+    else:
+        subprocess.run(["open", "-b", bundle_id], capture_output=True, timeout=5)
+
+
 # ── Formatting ────────────────────────────────────────────────────────────────
 
 NAME_WIDTH = 24
@@ -1420,6 +1475,163 @@ def _compute_deltas(prev, curr, sorted_projects, git_statuses):
     return deltas
 
 
+# ── Companion App Tracking ────────────────────────────────────────────────────
+
+_CLOG_PATH = "/tmp/itermdashboard_companion.log"
+def _clog(msg):
+    try:
+        with open(_CLOG_PATH, "a") as f:
+            f.write("%s %s\n" % (time.strftime("%H:%M:%S"), msg))
+    except Exception:
+        pass
+
+COMPANION_APPS = {
+    "BBEdit": {
+        "bundle": "com.barebones.bbedit",
+        "script": """tell application "BBEdit"
+set out to ""
+set dl to every text document
+repeat with i from 1 to count of dl
+try
+set f to file of (item i of dl)
+set out to out & (f as text) & "
+"
+end try
+end repeat
+return out
+end tell""",
+        "parse": "hfs_lines",
+    },
+    "PyCharm": {
+        "bundle": "com.jetbrains.pycharm.ce",
+        "script": None,  # Uses Quartz window list instead of AppleScript
+        "parse": "window_title",
+    },
+    "Finder": {
+        "bundle": "com.apple.finder",
+        "script": """tell application "Finder"
+set out to ""
+set n to count of Finder windows
+repeat with i from 1 to n
+try
+set out to out & (POSIX path of (target of Finder window i as alias)) & "
+"
+end try
+end repeat
+return out
+end tell""",
+    },
+}
+
+
+def get_companion_app_paths():
+    """Query companion apps for open file/folder paths.
+    Returns dict: {app_name: [path, ...]} for running apps only."""
+    result = {}
+    ws_apps = {app.bundleIdentifier() for app in NSWorkspace.sharedWorkspace().runningApplications()
+               if app.bundleIdentifier()}
+
+    for app_name, info in COMPANION_APPS.items():
+        if info["bundle"] not in ws_apps:
+            continue
+        try:
+            # For apps without native AppleScript, use NSAppleScript + System Events
+            # (runs in-process so automation permission is prompted for our app)
+            if info.get("script") is None:
+                se_script = ('tell application "System Events"\n'
+                             'set wins to every window of (first process whose bundle identifier is "' + info["bundle"] + '")\n'
+                             'set out to ""\n'
+                             'repeat with w in wins\n'
+                             'set out to out & name of w & linefeed\n'
+                             'end repeat\nreturn out\nend tell')
+                from Foundation import NSAppleScript
+                script_obj = NSAppleScript.alloc().initWithSource_(se_script)
+                result_desc, error_info = script_obj.executeAndReturnError_(None)
+                raw = result_desc.stringValue() if result_desc else ""
+                _clog("Companion %s (NSAppleScript): len=%d err=%s" % (app_name, len(raw) if raw else 0, error_info))
+                if raw and raw.strip():
+                    lines = [l.strip() for l in raw.splitlines() if l.strip()]
+                    parse_mode = info.get("parse", "posix")
+                    if parse_mode == "window_title":
+                        project_names = set()
+                        for title in lines:
+                            parts = title.split(" \u2013 ")
+                            if len(parts) < 2:
+                                parts = title.split(" - ")
+                            if parts:
+                                project_names.add(parts[0].strip())
+                        result[app_name] = list(project_names)
+                    else:
+                        result[app_name] = lines
+                continue
+
+            out = subprocess.run(
+                ["osascript", "-e", info["script"]],
+                capture_output=True, text=True, timeout=10,
+            )
+            _clog("Companion %s: rc=%d stdout=%d bytes stderr=%s" %
+                  (app_name, out.returncode, len(out.stdout), out.stderr.strip()[:200]))
+            if out.returncode != 0:
+                continue
+            raw = out.stdout.strip()
+            if not raw:
+                _clog("Companion %s: empty output" % app_name)
+                continue
+
+            lines = [l.strip() for l in raw.splitlines() if l.strip()]
+            parse_mode = info.get("parse", "posix")
+
+            if parse_mode == "hfs_lines":
+                # Convert HFS paths (Macintosh HD:Users:...) to POSIX
+                posix_paths = []
+                for hfs in lines:
+                    # Strip volume prefix, replace colons with slashes
+                    parts = hfs.split(":", 1)
+                    if len(parts) == 2:
+                        posix_paths.append("/" + parts[1].replace(":", "/"))
+                result[app_name] = posix_paths
+            elif parse_mode == "window_title":
+                # PyCharm titles: "project_name – filename.py"
+                project_names = set()
+                for title in lines:
+                    parts = title.split(" \u2013 ")
+                    if len(parts) < 2:
+                        parts = title.split(" - ")
+                    if parts:
+                        project_names.add(parts[0].strip())
+                result[app_name] = list(project_names)
+            else:
+                result[app_name] = lines
+        except Exception as e:
+            _clog("Companion %s: exception %s" % (app_name, str(e)))
+            continue
+    _clog("Companion results: %s" % str({k: len(v) for k, v in result.items()}))
+    return result
+
+
+def match_apps_to_projects(companion_paths, project_paths):
+    """Match companion app paths to project directories.
+    Returns dict: {project_path: [app_name, ...]}"""
+    matches = defaultdict(set)
+    for app_name, paths in companion_paths.items():
+        info = COMPANION_APPS[app_name]
+        for path in paths:
+            if info.get("parse") == "window_title":
+                # Match PyCharm project name against project directory basename
+                for proj_path in project_paths:
+                    proj_name = os.path.basename(proj_path)
+                    if path.lower() == proj_name.lower():
+                        matches[proj_path].add(app_name)
+            else:
+                # Match file/folder path against project directories
+                for proj_path in project_paths:
+                    if path.startswith(proj_path + "/") or path.rstrip("/") == proj_path.rstrip("/"):
+                        matches[proj_path].add(app_name)
+    result = {k: sorted(v) for k, v in matches.items()}
+    _clog("Match results: %s" % str(result))
+    return result
+
+
 def collect_menu_data(prev_snapshot=None):
     """Collect all data. Returns (data, session_map, project_window_map, snapshot)."""
     sessions = get_iterm_sessions()
@@ -1498,6 +1710,11 @@ def collect_menu_data(prev_snapshot=None):
     # Build snapshot and compute deltas
     snapshot = _compute_snapshot(sessions, sorted_projects, git_statuses, total_claude, total_claude_mem)
     deltas = _compute_deltas(prev_snapshot, snapshot, sorted_projects, git_statuses)
+
+    # Query companion apps (BBEdit, PyCharm, Finder) and match to projects
+    project_paths = [path for path, _ in sorted_projects]
+    companion_paths = get_companion_app_paths()
+    project_apps = match_apps_to_projects(companion_paths, project_paths)
 
     data = {
         "projects": [],
@@ -1659,6 +1876,7 @@ def collect_menu_data(prev_snapshot=None):
             "path": proj_path,
             "session_count": len(all_display),
             "claude_count": claude_count,
+            "companion_apps": project_apps.get(proj_path, []),
         })
 
     for i, s in enumerate(unassigned):
@@ -1829,7 +2047,7 @@ TERMINAL_BUNDLE_IDS = {
 
 
 def _build_sidebar_row(segments, indent=0, icon=None, tag=0, callback=None,
-                       delegate=None, tooltip=None, is_header=False):
+                       delegate=None, tooltip=None, is_header=False, right_margin=4):
     """Build a single row view with icon + attributed text."""
     row_height = 22 if not is_header else 26
     left_pad = 8 + indent * 14
@@ -1848,7 +2066,7 @@ def _build_sidebar_row(segments, indent=0, icon=None, tag=0, callback=None,
         x += 18
 
     # Create label first so we can measure its natural height
-    label = NSTextField.alloc().initWithFrame_(NSMakeRect(x, 0, SIDEBAR_WIDTH - x - 4, row_height))
+    label = NSTextField.alloc().initWithFrame_(NSMakeRect(x, 0, SIDEBAR_WIDTH - x - right_margin, row_height))
     label.setBezeled_(False)
     label.setDrawsBackground_(False)
     label.setEditable_(False)
@@ -1858,7 +2076,7 @@ def _build_sidebar_row(segments, indent=0, icon=None, tag=0, callback=None,
     # Center the label vertically in the row
     label_h = label.frame().size.height
     label_y = round((row_height - label_h) / 2.0)
-    label.setFrame_(NSMakeRect(x, label_y, SIDEBAR_WIDTH - x - 4, label_h))
+    label.setFrame_(NSMakeRect(x, label_y, SIDEBAR_WIDTH - x - right_margin, label_h))
     if tooltip:
         label.setToolTip_(tooltip)
     row.addSubview_(label)
@@ -1902,13 +2120,44 @@ def build_sidebar_content(data, delegate):
     rows.append(_build_separator())
 
     for proj in data["projects"]:
-        rows.append(_build_sidebar_row(
+        companion_apps = proj.get("companion_apps", [])
+        badge_size = 18
+        badge_pad = 3
+        # Reserve space on the right for companion app badges
+        right_margin = 8 + len(companion_apps) * (badge_size + badge_pad) if companion_apps else 4
+
+        row = _build_sidebar_row(
             proj["header_segments"],
             icon=sf_symbol("folder.fill", color=CLR_ACCENT, size=11.0),
             tag=proj["tag"], callback="projectClicked_", delegate=delegate,
             tooltip=f"{proj['path']}\n{proj['session_count']} sessions, {proj['claude_count']} Claude",
             is_header=True,
-        ))
+            right_margin=right_margin,
+        )
+
+        # Add companion app badges (right-aligned, clickable, real app icons)
+        if companion_apps:
+            badge_x = SIDEBAR_WIDTH - 6
+            row_h = row.frame().size.height
+            badge_y = round((row_h - badge_size) / 2.0)
+            for app_name in reversed(companion_apps):
+                info = COMPANION_APPS.get(app_name, {})
+                app_path = NSWorkspace.sharedWorkspace().absolutePathForAppBundleWithIdentifier_(info["bundle"])
+                app_icon = NSWorkspace.sharedWorkspace().iconForFile_(app_path) if app_path else None
+                if app_icon:
+                    badge_x -= badge_size + badge_pad
+                    app_icon.setSize_((badge_size, badge_size))
+                    btn = NSButton.alloc().initWithFrame_(NSMakeRect(badge_x, badge_y, badge_size, badge_size))
+                    btn.setImage_(app_icon)
+                    btn.setBordered_(False)
+                    btn.setToolTip_(app_name)
+                    btn.setTarget_(delegate)
+                    btn.setAction_(objc.selector(delegate.companionClicked_, signature=b'v@:@'))
+                    c_tag = proj["tag"] * 100 + hash(app_name) % 97
+                    btn.setTag_(c_tag)
+                    delegate._companion_map[c_tag] = (info["bundle"], app_name, proj["path"])
+                    row.addSubview_(btn)
+        rows.append(row)
 
         for sess in proj["sessions"]:
             if sess.get("type") == "subheader":
@@ -2025,6 +2274,7 @@ class AppDelegate(NSObject):
     _cached_data = objc.ivar()
     _session_map = objc.ivar()
     _project_window_map = objc.ivar()
+    _companion_map = objc.ivar()
     _prev_snapshot = objc.ivar()
     _lock = objc.ivar()
     _refresh_timer = objc.ivar()
@@ -2035,6 +2285,7 @@ class AppDelegate(NSObject):
         self._cached_data = None
         self._session_map = {}
         self._project_window_map = {}
+        self._companion_map = {}
         self._prev_snapshot = None
         self._lock = threading.Lock()
         self._sidebar_expanded = False
@@ -2468,6 +2719,17 @@ class AppDelegate(NSObject):
         if entry:
             window_ids, app = entry
             threading.Thread(target=raise_app_windows, args=(window_ids, app), daemon=True).start()
+
+    def companionClicked_(self, sender):
+        tag = sender.tag()
+        with self._lock:
+            entry = self._companion_map.get(tag)
+        if entry:
+            bundle_id, app_name, proj_path = entry
+            threading.Thread(
+                target=_raise_companion_app, args=(bundle_id, app_name, proj_path),
+                daemon=True,
+            ).start()
 
     def menuWillOpen_(self, menu):
         self._start_refresh()
