@@ -28,7 +28,7 @@ from AppKit import (
 )
 from Foundation import (
     NSDictionary, NSTimer, NSMakeRect, NSZeroRect,
-    NSNotificationCenter,
+    NSNotificationCenter, NSPointInRect,
 )
 
 
@@ -2096,8 +2096,8 @@ class AppDelegate(NSObject):
         win_rect = NSMakeRect(0, 0, SIDEBAR_COLLAPSED_WIDTH, screen.size.height)
 
         # NSPanel with nonactivating mask — won't steal focus from terminals
-        style = 0  # borderless
-        win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+        style = 0 | (1 << 7)  # borderless | NSWindowStyleMaskNonactivatingPanel
+        win = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
             win_rect, style, NSBackingStoreBuffered, False,
         )
         win.setLevel_(3)  # NSFloatingWindowLevel
@@ -2107,6 +2107,8 @@ class AppDelegate(NSObject):
         win.setHasShadow_(False)
         win.setOpaque_(False)
         win.setBackgroundColor_(NSColor.clearColor())
+        win.setFloatingPanel_(True)
+        win.setBecomesKeyOnlyIfNeeded_(True)
         win.setHidesOnDeactivate_(False)
 
         content = win.contentView()
@@ -2188,10 +2190,7 @@ class AppDelegate(NSObject):
         win = self._sidebar_window
         frame = win.frame()
 
-        # Check if mouse is inside the current window frame
-        in_zone = (mouse.x <= frame.size.width
-                   and mouse.y >= frame.origin.y
-                   and mouse.y <= frame.origin.y + frame.size.height)
+        in_zone = NSPointInRect(mouse, frame)
 
         if in_zone and not self._sidebar_expanded:
             # Hover delay: require mouse to stay in zone
