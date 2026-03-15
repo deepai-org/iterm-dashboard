@@ -1130,7 +1130,7 @@ CLR_GREEN = None       # healthy / clean
 CLR_ORANGE = None      # warning
 CLR_RED = None         # danger / high usage
 CLR_PURPLE = None      # claude instances
-CLR_CYAN = None        # uptime
+CLR_CYAN = None        # remote/SSH sessions
 
 
 def init_fonts_and_colors():
@@ -1143,15 +1143,15 @@ def init_fonts_and_colors():
     BOLD = NSFont.fontWithName_size_("Menlo-Bold", 12.0) or NSFont.boldSystemFontOfSize_(12.0)
     BOLD_SM = NSFont.fontWithName_size_("Menlo-Bold", 11.0) or NSFont.boldSystemFontOfSize_(11.0)
 
-    CLR_LABEL = NSColor.labelColor()
-    CLR_SECONDARY = NSColor.secondaryLabelColor()
-    CLR_DIM = NSColor.tertiaryLabelColor()
-    CLR_ACCENT = NSColor.systemBlueColor()
-    CLR_GREEN = NSColor.systemGreenColor()
-    CLR_ORANGE = NSColor.systemOrangeColor()
-    CLR_RED = NSColor.systemRedColor()
-    CLR_PURPLE = NSColor.systemPurpleColor()
-    CLR_CYAN = NSColor.systemCyanColor() if hasattr(NSColor, 'systemCyanColor') else NSColor.systemTealColor()
+    CLR_LABEL = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.93, 0.93, 0.95, 1.0)   # near-white: headers, primary text
+    CLR_SECONDARY = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.75, 0.77, 0.80, 1.0)  # light gray: shell names, info text
+    CLR_DIM = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.40, 0.42, 0.45, 1.0)    # dark gray: connectors, pipes, structural
+    CLR_ACCENT = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.45, 0.70, 0.95, 1.0)  # blue: project names, navigation
+    CLR_GREEN = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.40, 0.85, 0.50, 1.0)   # green: healthy, clean, low usage
+    CLR_ORANGE = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.95, 0.70, 0.25, 1.0)  # amber: warnings, moderate usage
+    CLR_RED = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.95, 0.40, 0.38, 1.0)     # red: danger, high usage, conflicts
+    CLR_PURPLE = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.72, 0.52, 0.98, 1.0)  # purple: AI/Claude instances only
+    CLR_CYAN = NSColor.colorWithCalibratedRed_green_blue_alpha_(0.35, 0.82, 0.85, 1.0)    # cyan: remote/SSH sessions only
 
 
 # ── SF Symbols ────────────────────────────────────────────────────────────────
@@ -1265,7 +1265,7 @@ def build_session_segments(s, is_last):
     elif uptime_secs >= 3 * 86400:
         uptime_clr = CLR_ORANGE
     elif uptime_secs >= 1 * 86400:
-        uptime_clr = CLR_CYAN
+        uptime_clr = CLR_SECONDARY
     else:
         uptime_clr = CLR_GREEN
 
@@ -1332,7 +1332,7 @@ def build_session_segments(s, is_last):
             tag_str = " ".join(tags)
             pad = max(1, 12 - len(tag_str))
             segments.append((" " * pad, MONO_SM, CLR_DIM))
-            tag_clr = CLR_RED if s.is_production else CLR_ORANGE if "zombie" in tags or "stale" in tags else CLR_CYAN
+            tag_clr = CLR_RED if s.is_production else CLR_ORANGE if "zombie" in tags or "stale" in tags else CLR_SECONDARY
             segments.append((tag_str, MONO_SM, tag_clr))
             segments.append((" \u2502 ", MONO_SM, CLR_DIM))
         else:
@@ -1391,7 +1391,7 @@ def build_insight_segments(text):
         ]
     elif text.startswith("[i]"):
         return [
-            ("[i]", BOLD_SM, CLR_CYAN),
+            ("[i]", BOLD_SM, CLR_ACCENT),
             (text[3:], MONO_SM, CLR_SECONDARY),
         ]
     return [(text, MONO_SM, CLR_SECONDARY)]
@@ -1970,13 +1970,13 @@ def collect_menu_data(prev_snapshot=None):
     if remote_count:
         data["summary_segments"] += [
             ("\u2502", MONO_SM, CLR_DIM),
-            (f" {remote_count}", BOLD_SM, CLR_CYAN),
+            (f" {remote_count}", BOLD_SM, CLR_ACCENT),
             (" remote ", MONO_SM, CLR_DIM),
         ]
     if total_lsp:
         data["summary_segments"] += [
             ("\u2502", MONO_SM, CLR_DIM),
-            (f" {total_lsp}", BOLD_SM, CLR_CYAN),
+            (f" {total_lsp}", BOLD_SM, CLR_ACCENT),
             (" LSP", MONO_SM, CLR_DIM),
         ]
 
@@ -2215,7 +2215,7 @@ def build_sidebar_content(data, delegate):
     if data.get("deltas"):
         rows.append(_build_sidebar_row(
             [("CHANGES", BOLD, CLR_LABEL)],
-            icon=sf_symbol("arrow.triangle.2.circlepath", color=CLR_CYAN, size=11.0),
+            icon=sf_symbol("arrow.triangle.2.circlepath", color=CLR_ACCENT, size=11.0),
             is_header=True,
         ))
         for line in data["deltas"]:
@@ -2226,8 +2226,8 @@ def build_sidebar_content(data, delegate):
                 clr = CLR_ORANGE
                 ico = sf_symbol("minus.circle.fill", color=CLR_ORANGE, size=9.0)
             else:
-                clr = CLR_CYAN
-                ico = sf_symbol("arrow.right.circle.fill", color=CLR_CYAN, size=9.0)
+                clr = CLR_ACCENT
+                ico = sf_symbol("arrow.right.circle.fill", color=CLR_ACCENT, size=9.0)
             rows.append(_build_sidebar_row(
                 [(line[:3], BOLD_SM, clr), (line[3:], MONO_SM, CLR_SECONDARY)],
                 indent=1, icon=ico,
@@ -2245,7 +2245,7 @@ def build_sidebar_content(data, delegate):
         if line.startswith("[!]"):
             ico = sf_symbol("exclamationmark.triangle.fill", color=CLR_ORANGE, size=9.0)
         else:
-            ico = sf_symbol("info.circle.fill", color=CLR_CYAN, size=9.0)
+            ico = sf_symbol("info.circle.fill", color=CLR_ACCENT, size=9.0)
         rows.append(_build_sidebar_row(segments, indent=1, icon=ico))
 
     # ── Summary ──
@@ -2667,7 +2667,7 @@ class AppDelegate(NSObject):
         # ── Changes Since Last Refresh ──
         if data.get("deltas"):
             changes_text = rich_text([("CHANGES", BOLD, CLR_LABEL)])
-            changes_icon = sf_symbol("arrow.triangle.2.circlepath", color=CLR_CYAN, size=12.0)
+            changes_icon = sf_symbol("arrow.triangle.2.circlepath", color=CLR_ACCENT, size=12.0)
             menu.addItem_(make_item(changes_text, image=changes_icon))
 
             for line in data["deltas"]:
@@ -2678,8 +2678,8 @@ class AppDelegate(NSObject):
                     clr = CLR_ORANGE
                     ico = sf_symbol("minus.circle.fill", color=CLR_ORANGE, size=10.0)
                 else:
-                    clr = CLR_CYAN
-                    ico = sf_symbol("arrow.right.circle.fill", color=CLR_CYAN, size=10.0)
+                    clr = CLR_ACCENT
+                    ico = sf_symbol("arrow.right.circle.fill", color=CLR_ACCENT, size=10.0)
                 segments = [(line[:3], BOLD_SM, clr), (line[3:], MONO_SM, CLR_SECONDARY)]
                 line_text = rich_text(segments)
                 menu.addItem_(make_item(line_text, indent=1, image=ico))
@@ -2697,7 +2697,7 @@ class AppDelegate(NSObject):
             if line.startswith("[!]"):
                 ico = sf_symbol("exclamationmark.triangle.fill", color=CLR_ORANGE, size=10.0)
             else:
-                ico = sf_symbol("info.circle.fill", color=CLR_CYAN, size=10.0)
+                ico = sf_symbol("info.circle.fill", color=CLR_ACCENT, size=10.0)
             menu.addItem_(make_item(line_text, indent=1, image=ico))
 
         menu.addItem_(NSMenuItem.separatorItem())
