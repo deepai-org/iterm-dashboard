@@ -2049,8 +2049,15 @@ TERMINAL_BUNDLE_IDS = {
 
 
 def _build_sidebar_row(segments, indent=0, icon=None, tag=0, callback=None,
-                       delegate=None, tooltip=None, is_header=False, right_margin=4):
-    """Build a single row view with icon + attributed text."""
+                       delegate=None, tooltip=None, is_header=False, right_margin=4,
+                       tree_lines=None):
+    """Build a single row view with icon + attributed text.
+
+    tree_lines: list of (level, kind) where level is indent depth (1-based) and kind is:
+        "mid"  = ├─  branch with continuation (vertical full height + horizontal)
+        "last" = └─  last branch (vertical top half + horizontal)
+        "cont" = │   vertical continuation only (no horizontal branch)
+    """
     row_height = 22 if not is_header else 26
     left_pad = 8 + indent * 14
 
@@ -2062,8 +2069,38 @@ def _build_sidebar_row(segments, indent=0, icon=None, tag=0, callback=None,
         row = FlippedView.alloc().initWithFrame_(NSMakeRect(0, 0, SIDEBAR_WIDTH, row_height))
 
     x = left_pad
-    icon_x = x
 
+    # Draw tree connector lines at each level
+    if tree_lines:
+        line_clr = CLR_SECONDARY.CGColor()
+        mid_y = round(row_height / 2.0)
+        for level, kind in tree_lines:
+            tree_x = 8 + level * 14 - 7  # x position for this indent level's vertical line
+
+            if kind in ("mid", "last"):
+                # Horizontal branch from vertical line to icon
+                h_line = NSView.alloc().initWithFrame_(NSMakeRect(tree_x, mid_y, 7, 1))
+                h_line.setWantsLayer_(True)
+                h_line.layer().setBackgroundColor_(line_clr)
+                row.addSubview_(h_line)
+
+            if kind == "mid":
+                v_line = NSView.alloc().initWithFrame_(NSMakeRect(tree_x, 0, 1, row_height))
+                v_line.setWantsLayer_(True)
+                v_line.layer().setBackgroundColor_(line_clr)
+                row.addSubview_(v_line)
+            elif kind == "last":
+                v_line = NSView.alloc().initWithFrame_(NSMakeRect(tree_x, 0, 1, mid_y))
+                v_line.setWantsLayer_(True)
+                v_line.layer().setBackgroundColor_(line_clr)
+                row.addSubview_(v_line)
+            elif kind == "cont":
+                v_line = NSView.alloc().initWithFrame_(NSMakeRect(tree_x, 0, 1, row_height))
+                v_line.setWantsLayer_(True)
+                v_line.layer().setBackgroundColor_(line_clr)
+                row.addSubview_(v_line)
+
+    icon_x = x
     if icon:
         x += 18
 
@@ -2073,7 +2110,13 @@ def _build_sidebar_row(segments, indent=0, icon=None, tag=0, callback=None,
     label.setDrawsBackground_(False)
     label.setEditable_(False)
     label.setSelectable_(False)
-    label.setAttributedStringValue_(rich_text(segments))
+    # Strip tree connector chars from segments for sidebar display
+    clean_segs = []
+    for text, font, color in segments:
+        cleaned = text.lstrip(" \u251C\u2514\u2500\u2502")
+        if cleaned:
+            clean_segs.append((cleaned, font, color))
+    label.setAttributedStringValue_(rich_text(clean_segs if clean_segs else segments))
     label.sizeToFit()
     # Center the label vertically in the row
     label_h = label.frame().size.height
@@ -2165,17 +2208,57 @@ def build_sidebar_content(data, delegate):
                     row.addSubview_(btn)
         rows.append(row)
 
-        for sess in proj["sessions"]:
+        sessions = proj["sessions"]
+
+        def _has_more_toplevel(after_idx):
+            """Check if there are more top-level items after after_idx."""
+            for j in range(after_idx, len(sessions)):
+                s = sessions[j]
+                if not s.get("in_subgroup"):
+                    return True
+            return False
+
+        for si, sess in enumerate(sessions):
             if sess.get("type") == "subheader":
+                more_top = _has_more_toplevel(si + 1)
+                # Find end of this subgroup to check if more top-level after it
+                end = si + 1
+                while end < len(sessions) and sessions[end].get("in_subgroup"):
+                    end += 1
+                more_after_group = _has_more_toplevel(end)
+                kind = "mid" if more_after_group else "last"
                 rows.append(_build_sidebar_row(
-                    [("\u25B8 ", MONO_SM, CLR_DIM), (sess["name"] + "/", BOLD_SM, CLR_ACCENT)],
+                    [(sess["name"] + "/", BOLD_SM, CLR_ACCENT)],
                     indent=1,
                     icon=sf_symbol("folder", color=CLR_DIM, size=10.0),
                     tag=sess["tag"], callback="projectClicked_", delegate=delegate,
+                    tree_lines=[(1, kind)],
                 ))
                 continue
 
-            indent = 2 if sess.get("in_subgroup") else 1
+            if sess.get("in_subgroup"):
+                # Is this the last in its subgroup?
+                is_last_sub = (si == len(sessions) - 1) or \
+                    not sessions[si + 1].get("in_subgroup") or \
+                    sessions[si + 1].get("type") == "subheader"
+                # Does the parent (level 1) continue after this subgroup?
+                end = si + 1
+                while end < len(sessions) and sessions[end].get("in_subgroup"):
+                    end += 1
+                parent_continues = _has_more_toplevel(end)
+                lines = []
+                # Level 1: continuation if more top-level siblings after this subgroup
+                if parent_continues:
+                    lines.append((1, "cont"))
+                # Level 2: branch for this child
+                lines.append((2, "last" if is_last_sub else "mid"))
+                indent = 2
+            else:
+                # Top-level session
+                more = _has_more_toplevel(si + 1)
+                lines = [(1, "mid" if more else "last")]
+                indent = 1
+
             rows.append(_build_sidebar_row(
                 sess["segments"],
                 indent=indent,
@@ -2186,6 +2269,7 @@ def build_sidebar_content(data, delegate):
                 ),
                 tag=sess["tag"], callback="sessionClicked_", delegate=delegate,
                 tooltip=sess.get("tooltip"),
+                tree_lines=lines,
             ))
 
         rows.append(_build_separator())
@@ -2197,7 +2281,9 @@ def build_sidebar_content(data, delegate):
             icon=sf_symbol("globe", color=CLR_SECONDARY, size=11.0),
             is_header=True,
         ))
-        for sess in data["unassigned"]:
+        unassigned = data["unassigned"]
+        for ui, sess in enumerate(unassigned):
+            kind = "last" if ui == len(unassigned) - 1 else "mid"
             rows.append(_build_sidebar_row(
                 sess["segments"],
                 indent=1,
@@ -2208,6 +2294,7 @@ def build_sidebar_content(data, delegate):
                 ),
                 tag=sess["tag"], callback="sessionClicked_", delegate=delegate,
                 tooltip=sess.get("tooltip"),
+                tree_lines=[(1, kind)],
             ))
         rows.append(_build_separator())
 
