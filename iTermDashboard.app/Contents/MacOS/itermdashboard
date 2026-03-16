@@ -25,6 +25,7 @@ from AppKit import (
     NSTrackingArea,
     NSVisualEffectView,
     NSWorkspace, NSAnimationContext, NSEvent,
+    NSApplicationActivateIgnoringOtherApps,
 )
 from Foundation import (
     NSDictionary, NSTimer, NSMakeRect, NSZeroRect,
@@ -678,16 +679,75 @@ def get_git_status(path):
 # ── iTerm2 Window Focus ──────────────────────────────────────────────────────
 
 def raise_app_window(window_id, app="iTerm2"):
-    script = f'''
+    """Raise a specific app window without bringing other windows forward.
+
+    Strategy:
+    1. Use AppleScript to set the target window's index to 1 (makes it AXWindows[0])
+    2. Use Accessibility API AXRaise on that window (raises just that one)
+    3. Use NSRunningApplication to activate the app (preserves single-window raise)
+    """
+    # Step 1: Reorder within the app so target is index 1
+    run_osascript(f'''
     tell application "{app}"
-        activate
-        repeat with w in every window
-            if id of w is {window_id} then
-                set index of w to 1
-            end if
-        end repeat
-    end tell'''
-    run_osascript(script)
+        set index of window id {window_id} to 1
+    end tell''')
+    # Step 2 & 3: AXRaise the now-frontmost window + activate
+    _ax_raise_and_activate(app)
+
+
+def _get_ax_fns():
+    """Load and cache HIServices accessibility functions."""
+    if not hasattr(_get_ax_fns, '_fns'):
+        _hi = objc.loadBundle('HIServices', {},
+            '/System/Library/Frameworks/ApplicationServices.framework/Frameworks/HIServices.framework')
+        fns = {}
+        objc.loadBundleFunctions(_hi, fns, [
+            ('AXUIElementCreateApplication', b'@i'),
+            ('AXUIElementPerformAction', b'i@@'),
+            ('AXUIElementCopyAttributeValue', b'i@@o^@'),
+        ])
+        _get_ax_fns._fns = fns
+    return _get_ax_fns._fns
+
+
+def _find_running_app(app_name):
+    """Find NSRunningApplication by localized name."""
+    for a in NSWorkspace.sharedWorkspace().runningApplications():
+        if a.localizedName() == app_name:
+            return a
+    return None
+
+
+def _ax_raise_and_activate(app):
+    """Activate app, then AXRaise only the frontmost window."""
+    _ax_raise_n_and_activate(app, 1)
+
+
+def _ax_raise_n_and_activate(app, count):
+    """Activate app, then AXRaise only the top N windows.
+
+    Activate first brings the app to foreground, then AXRaise repositions
+    just the target windows to the top of the global z-order.
+    Non-target windows fall back behind other apps.
+    """
+    try:
+        fns = _get_ax_fns()
+        running_app = _find_running_app(app)
+        if not running_app:
+            return
+        # Activate first — brings app to foreground
+        running_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+        time.sleep(0.15)
+        # Now AXRaise only the target windows (already at indices 0..N-1)
+        app_ref = fns['AXUIElementCreateApplication'](running_app.processIdentifier())
+        err, ax_windows = fns['AXUIElementCopyAttributeValue'](app_ref, 'AXWindows', None)
+        if err == 0 and ax_windows:
+            n = min(count, len(ax_windows))
+            for i in range(n - 1, -1, -1):
+                fns['AXUIElementPerformAction'](ax_windows[i], 'AXRaise')
+                time.sleep(0.03)
+    except Exception:
+        run_osascript(f'tell application "{app}" to activate')
 
 
 def _get_screen_bounds():
@@ -936,17 +996,18 @@ def raise_app_windows(window_ids, app="iTerm2"):
     # First tile if overlapping, then raise
     _tile_windows_if_overlapping(window_ids, app)
 
+    # Set target windows to top of app stack, then AXRaise each one
     conditions = " or ".join(f"id of w is {wid}" for wid in window_ids)
-    script = f'''
+    run_osascript(f'''
     tell application "{app}"
-        activate
         repeat with w in every window
             if {conditions} then
                 set index of w to 1
             end if
         end repeat
-    end tell'''
-    run_osascript(script)
+    end tell''')
+    time.sleep(0.05)
+    _ax_raise_n_and_activate(app, len(window_ids))
 
 
 def _raise_companion_app(bundle_id, app_name, proj_path):
