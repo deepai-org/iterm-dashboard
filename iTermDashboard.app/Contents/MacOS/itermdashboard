@@ -1345,6 +1345,12 @@ def build_session_segments(s, is_last):
             tags.append(s.activity_state)
 
     if s.is_claude:
+        # Busy/waiting detection: TTY idle < 5s means Claude is actively
+        # streaming output or running tools; idle >= 5s means waiting for user
+        claude_busy = s.idle_secs < 5
+        status_str = "\u25C9 busy" if claude_busy else "\u25CB idle"
+        status_clr = CLR_GREEN if claude_busy else CLR_DIM
+
         mem_str = format_bytes(s.mem_kb).rjust(5)
         mem_mb = s.mem_kb / 1024
         mem_clr = CLR_RED if mem_mb >= 800 else CLR_ORANGE if mem_mb >= 400 else CLR_GREEN
@@ -1353,6 +1359,8 @@ def build_session_segments(s, is_last):
         cpu_clr = CLR_RED if s.cpu >= 50 else CLR_ORANGE if s.cpu >= 10 else CLR_DIM
 
         segments += [
+            (" ", MONO_SM, None),
+            (status_str, BOLD_SM, status_clr),
             (" ", MONO_SM, None),
             (mem_str, MONO_SM, mem_clr),
             (" ", MONO_SM, None),
