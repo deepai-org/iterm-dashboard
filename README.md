@@ -7,12 +7,16 @@ A macOS menu bar app that shows all open iTerm2 windows grouped by project works
 ## Features
 
 - **Project grouping** — sessions grouped by working directory with git status badges
-- **Claude instance tracking** — memory, CPU, and uptime for all running Claude Code instances
-- **Color-coded metrics** — memory (green/orange/red), uptime aging, CPU heat
+- **Claude instance tracking** — memory, CPU, uptime, and busy/idle status for all running Claude Code instances
+- **Busy/idle detection** — real-time status indicator showing whether Claude is actively working or waiting for input
+- **Companion app tracking** — detects and links related BBEdit, PyCharm, and Finder windows per project
+- **Selective window raising** — click a project header to raise only that project's windows (not all app windows)
+- **Color-coded metrics** — semantic colors: blue=navigation, purple=AI/Claude, cyan=remote, green/amber/red=health
 - **SF Symbols** — native macOS icons for folders, terminals, CPU, insights
-- **Click to focus** — click a session to raise that iTerm2 window, click a project header to raise all its windows
+- **Click to focus** — click a session to raise that iTerm2 window, click a companion app to raise its project window
 - **Tooltips** — hover for full path, profile, terminal size, and process list
 - **Git status** — branch, dirty file count, ahead/behind, no-remote detection (walks up to find repo root)
+- **Tree connectors** — pixel-drawn tree lines for visual hierarchy
 - **System insights** — warnings for high memory, dirty files, unpushed commits, stale instances
 - **Auto-refresh** — updates every 30 seconds, plus on menu open
 
