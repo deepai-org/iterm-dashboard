@@ -682,16 +682,13 @@ def raise_app_window(window_id, app="iTerm2"):
     """Raise a specific app window without bringing other windows forward.
 
     Strategy:
-    1. Use AppleScript to set the target window's index to 1 (makes it AXWindows[0])
-    2. Use Accessibility API AXRaise on that window (raises just that one)
-    3. Use NSRunningApplication to activate the app (preserves single-window raise)
+    1. Use NSAppleScript (in-process, no subprocess) to set window index to 1
+    2. Activate + AXRaise to bring just that window forward
     """
-    # Step 1: Reorder within the app so target is index 1
-    run_osascript(f'''
-    tell application "{app}"
-        set index of window id {window_id} to 1
-    end tell''')
-    # Step 2 & 3: AXRaise the now-frontmost window + activate
+    from Foundation import NSAppleScript
+    script = NSAppleScript.alloc().initWithSource_(
+        f'tell application "{app}" to set index of window id {window_id} to 1')
+    script.executeAndReturnError_(None)
     _ax_raise_and_activate(app)
 
 
@@ -710,10 +707,16 @@ def _get_ax_fns():
     return _get_ax_fns._fns
 
 
+_running_app_cache = {}
+
 def _find_running_app(app_name):
-    """Find NSRunningApplication by localized name."""
+    """Find NSRunningApplication by localized name (cached)."""
+    cached = _running_app_cache.get(app_name)
+    if cached and not cached.isTerminated():
+        return cached
     for a in NSWorkspace.sharedWorkspace().runningApplications():
         if a.localizedName() == app_name:
+            _running_app_cache[app_name] = a
             return a
     return None
 
@@ -737,7 +740,6 @@ def _ax_raise_n_and_activate(app, count):
             return
         # Activate first — brings app to foreground
         running_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
-        time.sleep(0.15)
         # Now AXRaise only the target windows (already at indices 0..N-1)
         app_ref = fns['AXUIElementCreateApplication'](running_app.processIdentifier())
         err, ax_windows = fns['AXUIElementCopyAttributeValue'](app_ref, 'AXWindows', None)
@@ -745,61 +747,28 @@ def _ax_raise_n_and_activate(app, count):
             n = min(count, len(ax_windows))
             for i in range(n - 1, -1, -1):
                 fns['AXUIElementPerformAction'](ax_windows[i], 'AXRaise')
-                time.sleep(0.03)
     except Exception:
         run_osascript(f'tell application "{app}" to activate')
 
 
 def _get_screen_bounds():
-    """Get usable screen area (excluding menu bar) via AppleScript."""
-    raw = run_osascript('''
-        tell application "Finder"
-            set db to bounds of window of desktop
-            return (item 1 of db as text) & "," & (item 2 of db as text) & "," & (item 3 of db as text) & "," & (item 4 of db as text)
-        end tell
-    ''')
-    if raw:
-        try:
-            parts = [int(x.strip()) for x in raw.split(",")]
-            if len(parts) == 4:
-                # Adjust top for menu bar (~25px)
-                return (parts[0], max(parts[1], 25), parts[2], parts[3])
-        except ValueError:
-            pass
+    """Get usable screen area (excluding menu bar and dock) via NSScreen."""
+    screen = NSScreen.mainScreen()
+    if screen:
+        vf = screen.visibleFrame()
+        sf = screen.frame()
+        # Convert from NSScreen coordinates (origin bottom-left) to screen coords (origin top-left)
+        x1 = int(vf.origin.x)
+        y1 = int(sf.size.height - vf.origin.y - vf.size.height)
+        x2 = int(vf.origin.x + vf.size.width)
+        y2 = int(sf.size.height - vf.origin.y)
+        return (x1, y1, x2, y2)
     return (0, 25, 1920, 1080)
 
 
-def _tile_windows_if_overlapping(window_ids, app="iTerm2"):
-    """
-    Minimum-displacement window tiling via deterministic sequential placement.
-    Tries all permutations (N! — fine for ≤6 windows) to avoid the anchor problem.
-    Accepts the best solution even if minor overlap remains (e.g. 1px off-by-one).
-    """
-    if len(window_ids) <= 1:
-        return
-
-    # 1. Read current bounds for each window
-    read_parts = []
-    for wid in window_ids:
-        read_parts.append(f'''
-            if id of w is {wid} then
-                set b to bounds of w
-                set output to output & "{wid}," & item 1 of b & "," & item 2 of b & "," & item 3 of b & "," & item 4 of b & linefeed
-            end if''')
-
-    read_script = f'''
-    tell application "{app}"
-        set output to ""
-        repeat with w in every window
-            {"".join(read_parts)}
-        end repeat
-        return output
-    end tell'''
-
-    raw = run_osascript(read_script)
-    if not raw:
-        return
-
+def _tile_if_overlapping_from_bounds(raw, window_ids, app="iTerm2"):
+    """Tile windows if overlapping, using pre-read bounds string."""
+    from Foundation import NSAppleScript
     orig_positions = {}
     sizes = {}
     for line in raw.strip().splitlines():
@@ -989,25 +958,35 @@ def _tile_windows_if_overlapping(window_ids, app="iTerm2"):
                 {"".join(set_parts)}
             end repeat
         end tell'''
-        run_osascript(set_script)
+        NSAppleScript.alloc().initWithSource_(set_script).executeAndReturnError_(None)
 
 
 def raise_app_windows(window_ids, app="iTerm2"):
-    # First tile if overlapping, then raise
-    _tile_windows_if_overlapping(window_ids, app)
+    from Foundation import NSAppleScript
 
-    # Set target windows to top of app stack, then AXRaise each one
-    conditions = " or ".join(f"id of w is {wid}" for wid in window_ids)
-    run_osascript(f'''
-    tell application "{app}"
-        repeat with w in every window
-            if {conditions} then
-                set index of w to 1
-            end if
-        end repeat
-    end tell''')
-    time.sleep(0.05)
-    _ax_raise_n_and_activate(app, len(window_ids))
+    # Activate early so macOS starts bringing app forward in parallel
+    running_app = _find_running_app(app)
+    if running_app:
+        running_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+
+    # Set index for each target window individually (faster than looping all windows)
+    set_cmds = "\n".join(f'set index of window id {wid} to 1' for wid in window_ids)
+    script = NSAppleScript.alloc().initWithSource_(
+        f'tell application "{app}"\n{set_cmds}\nend tell')
+    script.executeAndReturnError_(None)
+
+    # AXRaise only the target windows
+    if running_app:
+        try:
+            fns = _get_ax_fns()
+            app_ref = fns['AXUIElementCreateApplication'](running_app.processIdentifier())
+            err, ax_windows = fns['AXUIElementCopyAttributeValue'](app_ref, 'AXWindows', None)
+            if err == 0 and ax_windows:
+                n = min(len(window_ids), len(ax_windows))
+                for i in range(n - 1, -1, -1):
+                    fns['AXUIElementPerformAction'](ax_windows[i], 'AXRaise')
+        except Exception:
+            pass
 
 
 def _raise_companion_app(bundle_id, app_name, proj_path):
