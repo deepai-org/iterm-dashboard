@@ -2,14 +2,13 @@
 
 A macOS menu bar app that shows all open iTerm2 windows grouped by project workspace.
 
-![screenshot](screenshot.png)
-
 ## Features
 
 - **Project grouping** — sessions grouped by working directory with git status badges
 - **Claude instance tracking** — memory, CPU, uptime, and busy/idle status for all running Claude Code instances
 - **Busy/idle detection** — real-time status indicator showing whether Claude is actively working or waiting for input
 - **Companion app tracking** — detects and links related BBEdit, PyCharm, and Finder windows per project
+- **Nexus terminal support** — also queries Nexus terminal windows alongside iTerm2
 - **Selective window raising** — click a project header to raise only that project's windows (not all app windows)
 - **Color-coded metrics** — semantic colors: blue=navigation, purple=AI/Claude, cyan=remote, green/amber/red=health
 - **SF Symbols** — native macOS icons for folders, terminals, CPU, insights
@@ -29,14 +28,6 @@ open iTermDashboard.app
 ```
 
 To launch on login, add `iTermDashboard.app` to System Settings > General > Login Items.
-
-## CLI Version
-
-A standalone terminal script that prints the same dashboard to stdout:
-
-```bash
-python3 iterm_dashboard.py
-```
 
 ## Useful Commands
 
@@ -76,5 +67,5 @@ iTermDashboard.app/
     Info.plist                  # App bundle config (LSUIElement for menu-bar-only)
     MacOS/itermdashboard        # Main Python executable
     Resources/AppIcon.icns      # Dock/Finder icon
-iterm_dashboard.py              # Standalone CLI version
+    Resources/AppIcon.png       # Source icon image
 ```
