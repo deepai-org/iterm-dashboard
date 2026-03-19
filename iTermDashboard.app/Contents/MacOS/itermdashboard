@@ -1978,7 +1978,7 @@ def collect_menu_data(prev_snapshot=None):
                 sub_app = sorted_group[0].app_source if sorted_group else proj_app
                 sub_window_ids = list(set(s.window_id for s in sorted_group))
                 project_window_map[sub_tag] = (sub_window_ids, sub_app)
-                subheader_positions[start_idx] = (proj_name + "/", sub_tag)
+                subheader_positions[start_idx] = (proj_name, sub_tag)
                 for j in range(len(sorted_group)):
                     in_subgroup_indices.add(start_idx + j)
             all_display.extend(sorted_group)
