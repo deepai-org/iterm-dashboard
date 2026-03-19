@@ -67,7 +67,7 @@ class Session:
     remote_target: str = ""
     is_production: bool = False
     # Source app for raise-to-front
-    app_source: str = "iTerm2"  # "iTerm2" or "Nexus"
+    app_source: str = "iTerm2"  # "iTerm2", "Nexus", or "Terminal"
 
 
 @dataclass
@@ -338,6 +338,101 @@ def get_nexus_sessions():
             if sess.get("busy"):
                 s.activity_state = "active"
             sessions.append(s)
+    return sessions
+
+
+def get_terminal_sessions():
+    """Query Apple Terminal.app for windows/sessions via AppleScript."""
+    script = '''
+    on escapeForJSON(theText)
+        set out to ""
+        repeat with c in characters of theText
+            set c to c as text
+            if c is "\\\\" then
+                set out to out & "\\\\\\\\"
+            else if c is "\\"" then
+                set out to out & "\\\\\\""
+            else if c is tab then
+                set out to out & "\\\\t"
+            else if c is return then
+                set out to out & "\\\\n"
+            else if c is (ASCII character 10) then
+                set out to out & "\\\\n"
+            else
+                set out to out & c
+            end if
+        end repeat
+        return out
+    end escapeForJSON
+
+    tell application "Terminal"
+        set output to "["
+        set first_win to true
+        repeat with w in every window
+            if not first_win then set output to output & ","
+            set first_win to false
+            set wId to id of w
+            set wName to my escapeForJSON(name of w)
+            set wBounds to bounds of w
+            set output to output & "{\\"wid\\":" & wId
+            set output to output & ",\\"wname\\":\\"" & wName & "\\""
+            set output to output & ",\\"bounds\\":[" & item 1 of wBounds & "," & item 2 of wBounds & "," & item 3 of wBounds & "," & item 4 of wBounds & "]"
+            set output to output & ",\\"sessions\\":["
+            set first_sess to true
+            set tabCounter to 0
+            repeat with t in every tab of w
+                set tabCounter to tabCounter + 1
+                if not first_sess then set output to output & ","
+                set first_sess to false
+                try
+                    set sTTY to tty of t
+                    set sCols to number of columns of t
+                    set sRows to number of rows of t
+                    set output to output & "{\\"tty\\":\\"" & sTTY & "\\""
+                    set output to output & ",\\"cols\\":" & sCols
+                    set output to output & ",\\"rows\\":" & sRows
+                    set output to output & ",\\"tab\\":" & tabCounter & "}"
+                on error
+                    set output to output & "{\\"error\\":true}"
+                end try
+            end repeat
+            set output to output & "]}"
+        end repeat
+        set output to output & "]"
+        return output
+    end tell
+    '''
+    raw = run_osascript(script)
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        sanitized = re.sub(r'[\x00-\x1f]+', ' ', raw)
+        try:
+            data = json.loads(sanitized)
+        except json.JSONDecodeError:
+            return []
+
+    sessions = []
+    for win in data:
+        if "error" in win:
+            continue
+        for sess in win.get("sessions", []):
+            if sess.get("error"):
+                continue
+            sessions.append(Session(
+                window_id=win["wid"],
+                window_name=win["wname"],
+                session_id=sess["tty"],
+                session_name=win["wname"],
+                tty=sess["tty"],
+                profile="",
+                columns=sess["cols"],
+                rows=sess["rows"],
+                bounds=tuple(win["bounds"]),
+                app_source="Terminal",
+            ))
     return sessions
 
 
@@ -964,6 +1059,23 @@ def _tile_if_overlapping_from_bounds(raw, window_ids, app="iTerm2"):
 def raise_app_windows(window_ids, app="iTerm2"):
     from Foundation import NSAppleScript
 
+    # Read bounds of target windows before raising (for overlap tiling)
+    if len(window_ids) >= 2:
+        bounds_checks = []
+        for wid in window_ids:
+            bounds_checks.append(
+                f'try\nset b to bounds of window id {wid}\n'
+                f'set output to output & "{wid}," & item 1 of b & "," & item 2 of b & "," & item 3 of b & "," & item 4 of b & linefeed\n'
+                f'end try')
+        bounds_script = NSAppleScript.alloc().initWithSource_(
+            f'tell application "{app}"\nset output to ""\n' +
+            "\n".join(bounds_checks) +
+            '\nreturn output\nend tell')
+        result, err = bounds_script.executeAndReturnError_(None)
+        bounds_raw = result.stringValue() if result else ""
+    else:
+        bounds_raw = ""
+
     # Activate early so macOS starts bringing app forward in parallel
     running_app = _find_running_app(app)
     if running_app:
@@ -987,6 +1099,10 @@ def raise_app_windows(window_ids, app="iTerm2"):
                     fns['AXUIElementPerformAction'](ax_windows[i], 'AXRaise')
         except Exception:
             pass
+
+    # Tile overlapping windows apart (only moves target windows)
+    if bounds_raw:
+        _tile_if_overlapping_from_bounds(bounds_raw, window_ids, app=app)
 
 
 def _raise_companion_app(bundle_id, app_name, proj_path):
@@ -1694,6 +1810,17 @@ def collect_menu_data(prev_snapshot=None):
         if running.stdout.strip() == "true":
             nexus_sessions = get_nexus_sessions()
             sessions.extend(nexus_sessions)
+    except Exception:
+        pass
+    # Also query Terminal.app if it's running
+    try:
+        running = subprocess.run(
+            ["osascript", "-e", 'application "Terminal" is running'],
+            capture_output=True, text=True, timeout=2,
+        )
+        if running.stdout.strip() == "true":
+            terminal_sessions = get_terminal_sessions()
+            sessions.extend(terminal_sessions)
     except Exception:
         pass
     if not sessions:
