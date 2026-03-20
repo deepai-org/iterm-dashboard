@@ -1186,6 +1186,27 @@ end tell''')
         subprocess.run(["open", "-b", bundle_id], capture_output=True, timeout=5)
 
 
+def _open_companion_app(bundle_id, app_name, folder_path):
+    """Open a folder in a companion app (Finder/BBEdit/PyCharm)."""
+    from Foundation import NSAppleScript
+    if app_name == "Finder":
+        script = NSAppleScript.alloc().initWithSource_(
+            f'tell application "Finder" to open POSIX file "{folder_path}"')
+        script.executeAndReturnError_(None)
+        _ax_raise_and_activate("Finder")
+    elif app_name == "BBEdit":
+        script = NSAppleScript.alloc().initWithSource_(
+            f'tell application "BBEdit" to open POSIX file "{folder_path}"')
+        script.executeAndReturnError_(None)
+        _ax_raise_and_activate("BBEdit")
+    elif app_name == "PyCharm":
+        subprocess.Popen(["open", "-b", bundle_id, folder_path],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    else:
+        subprocess.Popen(["open", "-b", bundle_id, folder_path],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
 # ── Formatting ────────────────────────────────────────────────────────────────
 
 NAME_WIDTH = 24
@@ -2251,7 +2272,7 @@ def collect_menu_data(prev_snapshot=None):
                 sub_app = sorted_group[0].app_source if sorted_group else proj_app
                 sub_window_ids = list(set(s.window_id for s in sorted_group))
                 project_window_map[sub_tag] = (sub_window_ids, sub_app)
-                subheader_positions[start_idx] = (subdir_name, sub_tag)
+                subheader_positions[start_idx] = (subdir_name, sub_tag, subdir_name)
                 for j in range(len(sorted_group)):
                     in_subgroup_indices.add(start_idx + j)
             elif has_subdirs and subdir_name == ".":
@@ -2260,7 +2281,7 @@ def collect_menu_data(prev_snapshot=None):
                 sub_app = sorted_group[0].app_source if sorted_group else proj_app
                 sub_window_ids = list(set(s.window_id for s in sorted_group))
                 project_window_map[sub_tag] = (sub_window_ids, sub_app)
-                subheader_positions[start_idx] = (proj_name, sub_tag)
+                subheader_positions[start_idx] = (proj_name, sub_tag, ".")
                 for j in range(len(sorted_group)):
                     in_subgroup_indices.add(start_idx + j)
             all_display.extend(sorted_group)
@@ -2271,11 +2292,13 @@ def collect_menu_data(prev_snapshot=None):
         for i, s in enumerate(all_display):
             # Insert sub-header if needed
             if i in subheader_positions:
-                sh_name, sh_tag = subheader_positions[i]
+                sh_name, sh_tag, sh_subdir = subheader_positions[i]
+                sh_path = proj_path if sh_subdir == "." else os.path.join(proj_path, sh_subdir)
                 session_entries.append({
                     "type": "subheader",
                     "name": sh_name,
                     "tag": sh_tag,
+                    "path": sh_path,
                 })
 
             is_last = (i == len(all_display) - 1)
@@ -2611,9 +2634,49 @@ def build_sidebar_content(data, delegate):
     rows = []
 
     delegate._companion_map = {}
+    delegate._open_companion_map = {}
     delegate._resume_map = {}
     delegate._next_companion_tag = 10000
     _resume_tag_counter = 20000
+
+    def _add_app_badges(row, folder_path, existing_apps):
+        """Add companion app badges to a row: solid for present apps, ghost for missing."""
+        badge_size = 18
+        badge_pad = 3
+        all_apps = ["Finder", "BBEdit", "PyCharm"]
+        badge_x = SIDEBAR_WIDTH - 6
+        row_h = row.frame().size.height
+        badge_y = round((row_h - badge_size) / 2.0)
+        for app_name in reversed(all_apps):
+            info = COMPANION_APPS.get(app_name, {})
+            app_path = NSWorkspace.sharedWorkspace().absolutePathForAppBundleWithIdentifier_(info["bundle"])
+            app_icon = NSWorkspace.sharedWorkspace().iconForFile_(app_path) if app_path else None
+            if not app_icon:
+                continue
+            badge_x -= badge_size + badge_pad
+            app_icon = app_icon.copy()
+            app_icon.setSize_((badge_size, badge_size))
+            is_present = app_name in existing_apps
+            btn = NSButton.alloc().initWithFrame_(NSMakeRect(badge_x, badge_y, badge_size, badge_size))
+            btn.setImage_(app_icon)
+            btn.setBordered_(False)
+            btn.setTarget_(delegate)
+            if is_present:
+                btn.setToolTip_(app_name)
+                btn.setAction_(objc.selector(delegate.companionClicked_, signature=b'v@:@'))
+                c_tag = delegate._next_companion_tag
+                delegate._next_companion_tag += 1
+                btn.setTag_(c_tag)
+                delegate._companion_map[c_tag] = (info["bundle"], app_name, folder_path)
+            else:
+                btn.setAlphaValue_(0.25)
+                btn.setToolTip_(f"Open in {app_name}")
+                btn.setAction_(objc.selector(delegate.openCompanionClicked_, signature=b'v@:@'))
+                c_tag = delegate._next_companion_tag
+                delegate._next_companion_tag += 1
+                btn.setTag_(c_tag)
+                delegate._open_companion_map[c_tag] = (info["bundle"], app_name, folder_path)
+            row.addSubview_(btn)
 
     if data is None:
         rows.append(_build_sidebar_row([("Loading...", MONO_SM, CLR_DIM)]))
@@ -2627,12 +2690,12 @@ def build_sidebar_content(data, delegate):
     ))
     rows.append(_build_separator())
 
+    # Pre-resolve app icon paths once (avoid repeated lookups per row)
+    _app_badge_size = 18
+    _app_badge_margin = 8 + 3 * (_app_badge_size + 3)  # space for 3 badges
+
     for proj in data["projects"]:
         companion_apps = proj.get("companion_apps", [])
-        badge_size = 18
-        badge_pad = 3
-        # Reserve space on the right for companion app badges
-        right_margin = 8 + len(companion_apps) * (badge_size + badge_pad) if companion_apps else 4
 
         row = _build_sidebar_row(
             proj["header_segments"],
@@ -2640,32 +2703,9 @@ def build_sidebar_content(data, delegate):
             tag=proj["tag"], callback="projectClicked_", delegate=delegate,
             tooltip=f"{proj['path']}\n{proj['session_count']} sessions, {proj['claude_count']} Claude",
             is_header=True,
-            right_margin=right_margin,
+            right_margin=_app_badge_margin,
         )
-
-        # Add companion app badges (right-aligned, clickable, real app icons)
-        if companion_apps:
-            badge_x = SIDEBAR_WIDTH - 6
-            row_h = row.frame().size.height
-            badge_y = round((row_h - badge_size) / 2.0)
-            for app_name in reversed(companion_apps):
-                info = COMPANION_APPS.get(app_name, {})
-                app_path = NSWorkspace.sharedWorkspace().absolutePathForAppBundleWithIdentifier_(info["bundle"])
-                app_icon = NSWorkspace.sharedWorkspace().iconForFile_(app_path) if app_path else None
-                if app_icon:
-                    badge_x -= badge_size + badge_pad
-                    app_icon.setSize_((badge_size, badge_size))
-                    btn = NSButton.alloc().initWithFrame_(NSMakeRect(badge_x, badge_y, badge_size, badge_size))
-                    btn.setImage_(app_icon)
-                    btn.setBordered_(False)
-                    btn.setToolTip_(app_name)
-                    btn.setTarget_(delegate)
-                    btn.setAction_(objc.selector(delegate.companionClicked_, signature=b'v@:@'))
-                    c_tag = delegate._next_companion_tag
-                    delegate._next_companion_tag += 1
-                    btn.setTag_(c_tag)
-                    delegate._companion_map[c_tag] = (info["bundle"], app_name, proj["path"])
-                    row.addSubview_(btn)
+        _add_app_badges(row, proj["path"], companion_apps)
         rows.append(row)
 
         sessions = proj["sessions"]
@@ -2689,13 +2729,17 @@ def build_sidebar_content(data, delegate):
                     end += 1
                 more_after_group = _has_more_toplevel(end)
                 kind = "mid" if more_after_group else "last"
-                rows.append(_build_sidebar_row(
+                sub_row = _build_sidebar_row(
                     [(sess["name"] + "/", BOLD_SM, CLR_ACCENT)],
                     indent=1,
                     icon=sf_symbol("folder", color=CLR_DIM, size=10.0),
                     tag=sess["tag"], callback="projectClicked_", delegate=delegate,
                     tree_lines=[(1, kind)],
-                ))
+                    right_margin=_app_badge_margin,
+                )
+                sub_path = sess.get("path", proj["path"])
+                _add_app_badges(sub_row, sub_path, companion_apps)
+                rows.append(sub_row)
                 continue
 
             if sess.get("in_subgroup"):
@@ -2860,6 +2904,7 @@ class AppDelegate(NSObject):
     _project_window_map = objc.ivar()
     _companion_map = objc.ivar()
     _resume_map = objc.ivar()
+    _open_companion_map = objc.ivar()
     _next_companion_tag = objc.ivar()
     _prev_snapshot = objc.ivar()
     _lock = objc.ivar()
@@ -2873,6 +2918,7 @@ class AppDelegate(NSObject):
         self._project_window_map = {}
         self._companion_map = {}
         self._resume_map = {}
+        self._open_companion_map = {}
         self._next_companion_tag = 10000
         self._prev_snapshot = None
         self._lock = threading.Lock()
@@ -3327,6 +3373,17 @@ class AppDelegate(NSObject):
             session_id, project_path = entry
             threading.Thread(
                 target=resume_claude_session, args=(session_id, project_path),
+                daemon=True,
+            ).start()
+
+    def openCompanionClicked_(self, sender):
+        tag = sender.tag()
+        with self._lock:
+            entry = self._open_companion_map.get(tag)
+        if entry:
+            bundle_id, app_name, folder_path = entry
+            threading.Thread(
+                target=_open_companion_app, args=(bundle_id, app_name, folder_path),
                 daemon=True,
             ).start()
 
