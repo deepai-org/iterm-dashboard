@@ -7,7 +7,7 @@ import re
 import os
 import time
 import threading
-from itertools import permutations
+from itertools import permutations, product
 from collections import defaultdict
 from dataclasses import dataclass, field
 
@@ -1823,6 +1823,152 @@ def match_apps_to_projects(companion_paths, project_paths):
     return result
 
 
+@dataclass
+class ClaudeSession:
+    """A resumable Claude Code session from history."""
+    session_id: str
+    project_path: str
+    summary: str
+    timestamp: float
+    size_kb: int = 0
+
+
+def _resolve_claude_project_key(key):
+    """Resolve a Claude project dir name like '-Users-kevin-Desktop-foo' to a real path.
+
+    Uses recursive backtracking: split on '-' and try grouping consecutive segments
+    into directory names joined by '-' or '_', checking the filesystem at each step.
+    """
+    segments = key.lstrip("-").split("-")
+
+    def _solve(idx, parent):
+        if idx >= len(segments):
+            return parent
+        # Try consuming 1, 2, 3, ... consecutive segments as one directory name
+        for length in range(1, len(segments) - idx + 1):
+            chunk = segments[idx:idx + length]
+            is_last_chunk = (idx + length == len(segments))
+            # Try different joiners between segments in this chunk
+            if length == 1:
+                candidates = [chunk[0]]
+            else:
+                # Generate all joiner combinations for this chunk (- and _)
+                # For efficiency, only try up to 3 segments; beyond that just use -
+                if length <= 3:
+                    joiners_combos = list(product("-_", repeat=length - 1))
+                else:
+                    joiners_combos = [("-",) * (length - 1), ("_",) * (length - 1)]
+                candidates = []
+                for joiners in joiners_combos:
+                    name = chunk[0]
+                    for j, seg in zip(joiners, chunk[1:]):
+                        name += j + seg
+                    candidates.append(name)
+
+            for name in candidates:
+                full = os.path.join(parent, name)
+                if os.path.isdir(full):
+                    result = _solve(idx + length, full)
+                    if result:
+                        return result
+            # Last chunk: accept best guess even if dir doesn't exist
+            if is_last_chunk:
+                return os.path.join(parent, candidates[0])
+        return None
+
+    return _solve(0, "/") or ("/" + key.lstrip("-").replace("-", "/"))
+
+
+def get_claude_sessions(max_per_project=6):
+    """Scan ~/.claude/projects/ for resumable Claude Code sessions.
+
+    Returns dict: {resolved_project_path: [ClaudeSession, ...]}
+    sorted by most recent first, up to max_per_project per project.
+    """
+    import glob as glob_mod
+    base = os.path.expanduser("~/.claude/projects")
+    if not os.path.isdir(base):
+        return {}
+
+    result = {}
+    for proj_dir in os.listdir(base):
+        proj_path_full = os.path.join(base, proj_dir)
+        if not os.path.isdir(proj_path_full):
+            continue
+
+        jsonls = glob_mod.glob(os.path.join(proj_path_full, "*.jsonl"))
+        if not jsonls:
+            continue
+
+        # Resolve the project directory name to a real filesystem path
+        real_path = _resolve_claude_project_key(proj_dir)
+        if not os.path.isdir(real_path):
+            continue
+
+        # Collect session info, sorted by most recent
+        sess_infos = []
+        for f in jsonls:
+            sid = os.path.basename(f).replace(".jsonl", "")
+            mtime = os.path.getmtime(f)
+            size_kb = os.path.getsize(f) // 1024
+
+            # Extract first user message as summary
+            summary = ""
+            try:
+                with open(f) as fh:
+                    for line in fh:
+                        d = json.loads(line)
+                        msg = d.get("message", {})
+                        if msg.get("role") == "user":
+                            content = msg.get("content", "")
+                            if isinstance(content, list):
+                                for c in content:
+                                    if isinstance(c, dict) and c.get("type") == "text":
+                                        summary = c["text"].strip()
+                                        break
+                            elif isinstance(content, str):
+                                summary = content.strip()
+                            if summary:
+                                break
+            except Exception:
+                pass
+
+            # Truncate summary to first line, max 80 chars
+            summary = summary.split("\n")[0][:80]
+
+            sess_infos.append(ClaudeSession(
+                session_id=sid,
+                project_path=real_path,
+                summary=summary or "(no summary)",
+                timestamp=mtime,
+                size_kb=size_kb,
+            ))
+
+        sess_infos.sort(key=lambda s: -s.timestamp)
+        result[real_path] = sess_infos[:max_per_project]
+
+    return result
+
+
+def resume_claude_session(session_id, project_path):
+    """Open a new iTerm2 tab in the project directory and resume a Claude session."""
+    from Foundation import NSAppleScript
+    # Escape for AppleScript
+    escaped_path = project_path.replace('"', '\\"')
+    escaped_sid = session_id.replace('"', '\\"')
+    script = NSAppleScript.alloc().initWithSource_(f'''
+tell application "iTerm2"
+    activate
+    tell current window
+        create tab with default profile
+        tell current session
+            write text "cd \\"{escaped_path}\\" && claude --resume \\"{escaped_sid}\\""
+        end tell
+    end tell
+end tell''')
+    script.executeAndReturnError_(None)
+
+
 def collect_menu_data(prev_snapshot=None):
     """Collect all data. Returns (data, session_map, project_window_map, snapshot)."""
     sessions = get_iterm_sessions()
@@ -1919,6 +2065,32 @@ def collect_menu_data(prev_snapshot=None):
                     if git_root not in projects:
                         projects[git_root]  # ensure key exists with empty list
                     companion_only_apps[git_root].add(app_name)
+
+    # Scan Claude Code session history — adds projects and resumable sessions
+    claude_sessions_by_project = get_claude_sessions(max_per_project=6)
+    for proj_path in claude_sessions_by_project:
+        git_root = find_git_root(proj_path) or proj_path
+        if git_root not in projects:
+            projects[git_root]  # ensure key exists with empty list
+
+    # Filter out sessions that are already active in a terminal
+    active_claude_projects = set()
+    for s in (sessions or []):
+        if s.is_claude and s.cwd:
+            root = git_root_cache.get(s.cwd) or find_git_root(s.cwd) or s.cwd
+            active_claude_projects.add(root)
+
+    # Build resumable sessions map (keyed by git root, excluding active ones)
+    resumable_sessions = {}  # project_path -> [ClaudeSession, ...]
+    for proj_path, cs_list in claude_sessions_by_project.items():
+        git_root = find_git_root(proj_path) or proj_path
+        # The most recent session in an active project is likely the running one — skip it
+        if git_root in active_claude_projects and cs_list:
+            filtered = cs_list[1:]  # skip the most recent (likely active)
+        else:
+            filtered = cs_list
+        if filtered:
+            resumable_sessions[git_root] = filtered
 
     if not sessions and not projects:
         return None, {}, {}, None
@@ -2139,6 +2311,7 @@ def collect_menu_data(prev_snapshot=None):
             "session_count": len(all_display),
             "claude_count": claude_count,
             "companion_apps": project_apps.get(proj_path, []),
+            "resumable": resumable_sessions.get(proj_path, []),
         })
 
     for i, s in enumerate(unassigned):
@@ -2413,7 +2586,9 @@ def build_sidebar_content(data, delegate):
     rows = []
 
     delegate._companion_map = {}
+    delegate._resume_map = {}
     delegate._next_companion_tag = 10000
+    _resume_tag_counter = 20000
 
     if data is None:
         rows.append(_build_sidebar_row([("Loading...", MONO_SM, CLR_DIM)]))
@@ -2469,6 +2644,7 @@ def build_sidebar_content(data, delegate):
         rows.append(row)
 
         sessions = proj["sessions"]
+        resumable = proj.get("resumable", [])
 
         def _has_more_toplevel(after_idx):
             """Check if there are more top-level items after after_idx."""
@@ -2476,7 +2652,8 @@ def build_sidebar_content(data, delegate):
                 s = sessions[j]
                 if not s.get("in_subgroup"):
                     return True
-            return False
+            # Resumable sessions also count as more items
+            return bool(resumable)
 
         for si, sess in enumerate(sessions):
             if sess.get("type") == "subheader":
@@ -2531,6 +2708,35 @@ def build_sidebar_content(data, delegate):
                 tooltip=sess.get("tooltip"),
                 tree_lines=lines,
             ))
+
+        # ── Resumable Claude sessions ──
+        if resumable:
+            for ri, cs in enumerate(resumable):
+                age_secs = time.time() - cs.timestamp
+                age_str = format_age(int(age_secs))
+                summary = cs.summary
+                # Truncate summary to fit
+                max_summary = 40
+                if len(summary) > max_summary:
+                    summary = summary[:max_summary - 1] + "\u2026"
+                is_last = (ri == len(resumable) - 1)
+                segments = [
+                    ("\u25B7 ", MONO_SM, CLR_DIM),
+                    (summary + "  ", MONO_SM, CLR_SECONDARY),
+                    (age_str, MONO_SM, CLR_DIM),
+                ]
+                r_tag = _resume_tag_counter
+                _resume_tag_counter += 1
+                delegate._resume_map[r_tag] = (cs.session_id, cs.project_path)
+                tree_kind = "last" if is_last else "mid"
+                rows.append(_build_sidebar_row(
+                    segments,
+                    indent=1,
+                    icon=sf_symbol("arrow.counterclockwise", color=CLR_DIM, size=9.0),
+                    tag=r_tag, callback="resumeClicked_", delegate=delegate,
+                    tooltip=f"Resume: {cs.summary}\nSession: {cs.session_id}\nSize: {cs.size_kb}KB",
+                    tree_lines=[(1, tree_kind)],
+                ))
 
         rows.append(_build_separator())
 
@@ -2628,6 +2834,7 @@ class AppDelegate(NSObject):
     _session_map = objc.ivar()
     _project_window_map = objc.ivar()
     _companion_map = objc.ivar()
+    _resume_map = objc.ivar()
     _next_companion_tag = objc.ivar()
     _prev_snapshot = objc.ivar()
     _lock = objc.ivar()
@@ -2640,6 +2847,7 @@ class AppDelegate(NSObject):
         self._session_map = {}
         self._project_window_map = {}
         self._companion_map = {}
+        self._resume_map = {}
         self._next_companion_tag = 10000
         self._prev_snapshot = None
         self._lock = threading.Lock()
@@ -3083,6 +3291,17 @@ class AppDelegate(NSObject):
             bundle_id, app_name, proj_path = entry
             threading.Thread(
                 target=_raise_companion_app, args=(bundle_id, app_name, proj_path),
+                daemon=True,
+            ).start()
+
+    def resumeClicked_(self, sender):
+        tag = sender.tag()
+        with self._lock:
+            entry = self._resume_map.get(tag)
+        if entry:
+            session_id, project_path = entry
+            threading.Thread(
+                target=resume_claude_session, args=(session_id, project_path),
                 daemon=True,
             ).start()
 
