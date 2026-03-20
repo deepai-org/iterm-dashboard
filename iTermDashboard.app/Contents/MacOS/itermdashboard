@@ -1951,19 +1951,16 @@ def get_claude_sessions(max_per_project=6):
 
 
 def resume_claude_session(session_id, project_path):
-    """Open a new iTerm2 tab in the project directory and resume a Claude session."""
+    """Open a new iTerm2 window in the project directory and resume a Claude session."""
     from Foundation import NSAppleScript
-    # Escape for AppleScript
     escaped_path = project_path.replace('"', '\\"')
     escaped_sid = session_id.replace('"', '\\"')
     script = NSAppleScript.alloc().initWithSource_(f'''
 tell application "iTerm2"
     activate
-    tell current window
-        create tab with default profile
-        tell current session
-            write text "cd \\"{escaped_path}\\" && claude --resume \\"{escaped_sid}\\""
-        end tell
+    set newWindow to (create window with default profile)
+    tell current session of newWindow
+        write text "cd \\"{escaped_path}\\" && claude --resume \\"{escaped_sid}\\""
     end tell
 end tell''')
     script.executeAndReturnError_(None)
