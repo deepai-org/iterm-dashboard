@@ -12,6 +12,7 @@ A macOS menu bar app that shows all open iTerm2 windows grouped by project works
 - **Selective window raising** — click a project header to raise only that project's windows; companion app clicks raise only the matching window via AXRaise, not all app windows
 - **Color-coded metrics** — semantic colors: blue=navigation, purple=AI/Claude, cyan=remote, green/amber/red=health
 - **SF Symbols** — native macOS icons for folders, terminals, CPU, insights
+- **Resumable Claude sessions** — sidebar and menu bar show recent Claude Code sessions with click-to-resume
 - **Click to focus** — click a session to raise that iTerm2 window, click a companion app to raise its project window
 - **Tooltips** — hover for full path, profile, terminal size, and process list
 - **Git status** — dedicated row per project showing branch, modified/new/staged counts, ahead/behind, stashes, and last commit age in human-readable format

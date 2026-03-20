@@ -2950,6 +2950,14 @@ def build_sidebar_content(data, delegate):
     rows.append(_build_separator())
     rows.append(_build_sidebar_row(data.get("summary_segments", []), indent=0))
 
+    # ── Quit ──
+    rows.append(_build_separator())
+    rows.append(_build_sidebar_row(
+        [("Quit", MONO_SM, CLR_DIM)],
+        icon=sf_symbol("power", color=CLR_DIM, size=9.0),
+        tag=-1, callback="quitClicked_", delegate=delegate,
+    ))
+
     return rows
 
 
@@ -3286,6 +3294,9 @@ class AppDelegate(NSObject):
         with self._lock:
             data = self._cached_data
 
+        # Clear maps that will be repopulated (sidebar clears its own in build_sidebar_content)
+        self._resume_map = {}
+
         menu = NSMenu.alloc().init()
         menu.setDelegate_(self)
         menu.setAutoenablesItems_(False)
@@ -3305,8 +3316,21 @@ class AppDelegate(NSObject):
         menu.addItem_(make_item(header_text, image=header_icon))
         menu.addItem_(NSMenuItem.separatorItem())
 
+        _menu_resume_tag = 20000
+
         for proj in data["projects"]:
-            proj_text = rich_text(proj["header_segments"])
+            # ── Companion app indicators ──
+            companion_apps = proj.get("companion_apps", [])
+            companion_suffix = ""
+            if companion_apps:
+                app_abbrevs = {"BBEdit": "BB", "PyCharm": "Py", "Finder": "F"}
+                labels = [app_abbrevs.get(a, a) for a in sorted(companion_apps)]
+                companion_suffix = "  " + " ".join(labels)
+
+            header_segs = list(proj["header_segments"])
+            if companion_suffix:
+                header_segs.append((companion_suffix, MONO_SM, CLR_DIM))
+            proj_text = rich_text(header_segs)
             folder_icon = sf_symbol("folder.fill", color=CLR_ACCENT, size=12.0)
             item = make_item(
                 proj_text, action="projectClicked:", target=self,
@@ -3315,6 +3339,13 @@ class AppDelegate(NSObject):
             )
             item.setEnabled_(True)
             menu.addItem_(item)
+
+            # ── Git status row ──
+            git_segs = proj.get("git_segments")
+            if git_segs:
+                git_text = rich_text(git_segs)
+                git_icon = sf_symbol("arrow.triangle.branch", color=CLR_DIM, size=10.0)
+                menu.addItem_(make_item(git_text, indent=1, image=git_icon))
 
             for sess in proj["sessions"]:
                 if sess.get("type") == "subheader":
@@ -3345,6 +3376,30 @@ class AppDelegate(NSObject):
                 )
                 item.setEnabled_(True)
                 menu.addItem_(item)
+
+            # ── Resumable Claude sessions ──
+            for cs in proj.get("resumable", []):
+                age_secs = time.time() - cs.timestamp
+                age_str = format_age(int(age_secs))
+                summary = cs.summary
+                if len(summary) > 40:
+                    summary = summary[:39] + "\u2026"
+                segs = [
+                    ("\u25B7 ", MONO_SM, CLR_DIM),
+                    (summary + "  ", MONO_SM, CLR_SECONDARY),
+                    (age_str, MONO_SM, CLR_DIM),
+                ]
+                resume_icon = sf_symbol("arrow.counterclockwise", color=CLR_DIM, size=10.0)
+                r_tag = _menu_resume_tag
+                _menu_resume_tag += 1
+                self._resume_map[r_tag] = (cs.session_id, cs.project_path)
+                r_item = make_item(
+                    rich_text(segs), indent=1, image=resume_icon,
+                    action="resumeClicked:", target=self, tag=r_tag,
+                    tooltip=f"Resume: {cs.summary}\nSession: {cs.session_id}\nSize: {cs.size_kb}KB",
+                )
+                r_item.setEnabled_(True)
+                menu.addItem_(r_item)
 
             menu.addItem_(NSMenuItem.separatorItem())
 
@@ -3469,6 +3524,9 @@ class AppDelegate(NSObject):
                 target=_open_companion_app, args=(bundle_id, app_name, folder_path),
                 daemon=True,
             ).start()
+
+    def quitClicked_(self, sender):
+        NSApplication.sharedApplication().terminate_(None)
 
     def menuWillOpen_(self, menu):
         self._start_refresh()
