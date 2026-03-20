@@ -3100,6 +3100,10 @@ class AppDelegate(NSObject):
         if container is None:
             return
 
+        # Save scroll position before rebuilding
+        clip = self._sidebar_scroll.contentView()
+        saved_origin = clip.bounds().origin
+
         # Remove all existing subviews
         for view in list(container.subviews()):
             view.removeFromSuperview()
@@ -3107,7 +3111,7 @@ class AppDelegate(NSObject):
         # Build new rows and lay them out top-to-bottom
         rows = build_sidebar_content(data, self)
         y = 4  # top padding
-        width = max(SIDEBAR_WIDTH, int(self._sidebar_scroll.contentView().bounds().size.width))
+        width = max(SIDEBAR_WIDTH, int(clip.bounds().size.width))
         for row in rows:
             # Get the row's intrinsic height from its constraint or frame
             h = int(row.frame().size.height) or 22
@@ -3118,9 +3122,12 @@ class AppDelegate(NSObject):
 
         # Resize container to fit all content
         container.setFrameSize_((width, y + 4))
-        # Scroll to top
-        self._sidebar_scroll.contentView().scrollToPoint_((0, 0))
-        self._sidebar_scroll.reflectScrolledClipView_(self._sidebar_scroll.contentView())
+
+        # Restore scroll position (clamped to new content height)
+        max_y = max(0, (y + 4) - clip.bounds().size.height)
+        restored_y = min(saved_origin.y, max_y)
+        clip.scrollToPoint_((0, restored_y))
+        self._sidebar_scroll.reflectScrolledClipView_(clip)
 
     # ── Auto-hide: expand / collapse ──
 
