@@ -1912,29 +1912,57 @@ def get_claude_sessions(max_per_project=6):
             mtime = os.path.getmtime(f)
             size_kb = os.path.getsize(f) // 1024
 
-            # Extract first user message as summary
+            # Extract summary: skip boilerplate, find first real user message
+            # Also grab the last assistant text as fallback context
             summary = ""
+            last_assistant_text = ""
+            _skip_prefixes = (
+                "[Request interrupted",
+                "This session is being continued",
+                "<local-command-caveat>",
+            )
             try:
                 with open(f) as fh:
                     for line in fh:
                         d = json.loads(line)
                         msg = d.get("message", {})
-                        if msg.get("role") == "user":
-                            content = msg.get("content", "")
-                            if isinstance(content, list):
-                                for c in content:
-                                    if isinstance(c, dict) and c.get("type") == "text":
-                                        summary = c["text"].strip()
+                        role = msg.get("role", "")
+                        content = msg.get("content", "")
+                        text = ""
+                        if isinstance(content, list):
+                            for c in content:
+                                if isinstance(c, dict) and c.get("type") == "text":
+                                    text = c["text"].strip()
+                                    break
+                        elif isinstance(content, str):
+                            text = content.strip()
+                        if not text:
+                            continue
+                        if role == "assistant":
+                            last_assistant_text = text
+                        if role == "user":
+                            if any(text.startswith(p) for p in _skip_prefixes):
+                                continue
+                            # Found a real user message
+                            # If it's a plan, extract the plan title
+                            if text.startswith("Implement the following plan:"):
+                                for tline in text.split("\n"):
+                                    tline = tline.strip().lstrip("#").strip()
+                                    if tline and tline != "Implement the following plan:":
+                                        summary = tline
                                         break
-                            elif isinstance(content, str):
-                                summary = content.strip()
-                            if summary:
-                                break
+                            else:
+                                summary = text.split("\n")[0]
+                            break
             except Exception:
                 pass
 
-            # Truncate summary to first line, max 80 chars
-            summary = summary.split("\n")[0][:80]
+            # Fallback: use last assistant message if no good user message found
+            if not summary and last_assistant_text:
+                summary = last_assistant_text.split("\n")[0]
+
+            # Truncate to max 80 chars
+            summary = summary[:80]
 
             sess_infos.append(ClaudeSession(
                 session_id=sid,
