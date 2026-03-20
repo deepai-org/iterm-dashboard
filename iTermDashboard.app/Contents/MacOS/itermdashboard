@@ -86,6 +86,7 @@ class GitStatus:
     detached: bool = False
     special_state: str = ""  # rebase|merge|cherry-pick|bisect
     last_commit_age_secs: int = 0
+    last_commit_msg: str = ""
     worktree: bool = False
 
 
@@ -759,10 +760,14 @@ def get_git_status(path):
     elif os.path.isfile(os.path.join(git_dir, "BISECT_LOG")):
         gs.special_state = "BISECT"
 
-    # Last commit age
-    ts = run_args(["git", "-C", path, "log", "-1", "--format=%ct"])
-    if ts and ts.isdigit():
-        gs.last_commit_age_secs = int(time.time()) - int(ts)
+    # Last commit age and message (single git call)
+    log_out = run_args(["git", "-C", path, "log", "-1", "--format=%ct%n%s"])
+    if log_out:
+        log_lines = log_out.splitlines()
+        if log_lines and log_lines[0].isdigit():
+            gs.last_commit_age_secs = int(time.time()) - int(log_lines[0])
+        if len(log_lines) > 1:
+            gs.last_commit_msg = log_lines[1]
 
     # Stash count
     stash_out = run_args(["git", "-C", path, "stash", "list", "--oneline"])
@@ -1306,50 +1311,49 @@ def git_badge(gs):
 
     # Special state prefix
     if gs.special_state:
-        parts.append(gs.special_state)
-        parts.append("|")
+        parts.append(gs.special_state + " |")
 
-    # Branch (with detached indicator)
-    if gs.detached:
-        parts.append(f"@{gs.branch}")
-    else:
-        parts.append(gs.branch)
-
-    # Worktree indicator
+    # Branch (with detached/worktree indicator)
+    branch = f"@{gs.branch}" if gs.detached else gs.branch
     if gs.worktree:
-        parts.append("(wt)")
+        branch += " (wt)"
+    parts.append(branch)
 
-    # File status breakdown
+    # File status — human-readable
     if gs.dirty:
         status_parts = []
         if gs.staged:
-            status_parts.append(f"S{gs.staged}")
+            status_parts.append(f"{gs.staged} staged")
         if gs.modified:
-            status_parts.append(f"M{gs.modified}")
+            status_parts.append(f"{gs.modified} mod")
         if gs.untracked:
-            status_parts.append(f"?{gs.untracked}")
+            status_parts.append(f"{gs.untracked} new")
         if gs.conflicts:
-            status_parts.append(f"!{gs.conflicts}")
-        parts.append(" ".join(status_parts) if status_parts else f"*{gs.dirty}")
+            status_parts.append(f"{gs.conflicts} conflict")
+        parts.append(", ".join(status_parts) if status_parts else f"{gs.dirty} dirty")
     else:
-        parts.append("\u2713")
+        parts.append("\u2713 clean")
 
     # Remote tracking
     if gs.has_remote:
-        if gs.ahead:
-            parts.append(f"\u2191{gs.ahead}")
-        if gs.behind:
-            parts.append(f"\u2193{gs.behind}")
-        if not gs.ahead and not gs.behind:
-            parts.append("=")
+        if gs.ahead and gs.behind:
+            parts.append(f"\u2191{gs.ahead} \u2193{gs.behind}")
+        elif gs.ahead:
+            parts.append(f"\u2191{gs.ahead} unpushed")
+        elif gs.behind:
+            parts.append(f"\u2193{gs.behind} behind")
     else:
-        parts.append("\u2298")
+        parts.append("no remote")
+
+    # Stashes
+    if gs.stashes:
+        parts.append(f"{gs.stashes} stash")
 
     # Last commit age (only if > 1 day)
     if gs.last_commit_age_secs > 86400:
-        parts.append(f"({format_age(gs.last_commit_age_secs)} ago)")
+        parts.append(f"{format_age(gs.last_commit_age_secs)} ago")
 
-    return "[" + " ".join(parts) + "]"
+    return parts[0] + "  " + " \u00B7 ".join(parts[1:])
 
 
 # ── Colors ────────────────────────────────────────────────────────────────────
@@ -1592,33 +1596,14 @@ def build_session_segments(s, is_last):
     return segments
 
 
-def build_project_header_segments(proj_name, gs, warning, role_summary=""):
-    """Build rich text segments for a project header."""
-    badge = git_badge(gs)
+def build_project_header_segments(proj_name, warning, role_summary=""):
+    """Build rich text segments for a project header (name only)."""
     segments = [
-        (f"{proj_name}  ", BOLD, CLR_ACCENT),
+        (proj_name, BOLD, CLR_ACCENT),
     ]
 
-    # Special state gets its own prominent color
-    if gs.special_state:
-        # Split badge to color special state differently
-        segments.append((gs.special_state, BOLD_SM, CLR_RED))
-        rest = badge[len(gs.special_state):]
-        badge_clr = CLR_RED if gs.conflicts else CLR_ORANGE if gs.dirty > 0 else CLR_GREEN
-        segments.append((rest, MONO_SM, badge_clr))
-    elif not gs.is_git:
-        segments.append((badge, MONO_SM, CLR_DIM))
-    elif gs.conflicts:
-        segments.append((badge, MONO_SM, CLR_RED))
-    elif gs.dirty > 20:
-        segments.append((badge, MONO_SM, CLR_RED))
-    elif gs.dirty > 0:
-        segments.append((badge, MONO_SM, CLR_ORANGE))
-    else:
-        segments.append((badge, MONO_SM, CLR_GREEN))
-
     if warning:
-        segments.append((f" {warning}", MONO_SM, CLR_RED))
+        segments.append((f"  {warning}", MONO_SM, CLR_RED))
 
     # Compact role summary
     if role_summary:
@@ -1626,6 +1611,24 @@ def build_project_header_segments(proj_name, gs, warning, role_summary=""):
         segments.append((role_summary, MONO_SM, CLR_DIM))
 
     return segments
+
+
+def build_git_status_segments(gs):
+    """Build rich text segments for a git status row below the project header."""
+    if not gs.is_git:
+        return None  # No row needed
+    badge = git_badge(gs)
+    if gs.special_state:
+        clr = CLR_RED
+    elif gs.conflicts:
+        clr = CLR_RED
+    elif gs.dirty > 20:
+        clr = CLR_RED
+    elif gs.dirty > 0:
+        clr = CLR_ORANGE
+    else:
+        clr = CLR_GREEN
+    return [(badge, MONO_SM, clr)]
 
 
 def build_insight_segments(text):
@@ -2389,7 +2392,8 @@ def collect_menu_data(prev_snapshot=None):
             })
 
         data["projects"].append({
-            "header_segments": build_project_header_segments(proj_name, gs, warning, role_summary),
+            "header_segments": build_project_header_segments(proj_name, warning, role_summary),
+            "git_segments": build_git_status_segments(gs),
             "tag": proj_tag,
             "sessions": session_entries,
             "path": proj_path,
@@ -2562,7 +2566,7 @@ class ClickableRow(FlippedView):
 
     def drawRect_(self, rect):
         if self._hovered:
-            NSColor.controlAccentColor().colorWithAlphaComponent_(0.15).set()
+            NSColor.controlAccentColor().colorWithAlphaComponent_(0.55).set()
             from AppKit import NSBezierPath
             NSBezierPath.fillRect_(self.bounds())
 
@@ -2767,6 +2771,18 @@ def build_sidebar_content(data, delegate):
         )
         _add_app_badges(row, proj["path"], companion_apps)
         rows.append(row)
+
+        # Git status on its own row
+        git_segs = proj.get("git_segments")
+        if git_segs:
+            has_children = bool(proj["sessions"]) or bool(proj.get("resumable"))
+            git_row = _build_sidebar_row(
+                git_segs,
+                indent=1,
+                icon=sf_symbol("arrow.triangle.branch", color=CLR_DIM, size=9.0),
+                tree_lines=[(1, "mid" if has_children else "last")],
+            )
+            rows.append(git_row)
 
         sessions = proj["sessions"]
         resumable = proj.get("resumable", [])
