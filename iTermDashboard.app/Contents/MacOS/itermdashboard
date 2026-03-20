@@ -828,14 +828,12 @@ def _ax_raise_n_and_activate(app, count):
     just the target windows to the top of the global z-order.
     Non-target windows fall back behind other apps.
     """
+    running_app = _find_running_app(app) if isinstance(app, str) else app
+    if not running_app:
+        return
     try:
         fns = _get_ax_fns()
-        running_app = _find_running_app(app)
-        if not running_app:
-            return
-        # Activate first — brings app to foreground
         running_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
-        # Now AXRaise only the target windows (already at indices 0..N-1)
         app_ref = fns['AXUIElementCreateApplication'](running_app.processIdentifier())
         err, ax_windows = fns['AXUIElementCopyAttributeValue'](app_ref, 'AXWindows', None)
         if err == 0 and ax_windows:
@@ -843,7 +841,46 @@ def _ax_raise_n_and_activate(app, count):
             for i in range(n - 1, -1, -1):
                 fns['AXUIElementPerformAction'](ax_windows[i], 'AXRaise')
     except Exception:
-        run_osascript(f'tell application "{app}" to activate')
+        name = running_app.localizedName() if not isinstance(app, str) else app
+        run_osascript(f'tell application "{name}" to activate')
+
+
+def _ax_raise_matching_window(bundle_id, match_fn):
+    """Find a window whose AX attributes satisfy match_fn, AXRaise it, activate the app.
+
+    match_fn(ax_window, fns) -> bool is called for each window until one matches.
+    Returns True if a window was raised, False otherwise.
+    """
+    running_app = _find_running_app_by_bundle(bundle_id)
+    if not running_app:
+        return False
+    try:
+        fns = _get_ax_fns()
+        app_ref = fns['AXUIElementCreateApplication'](running_app.processIdentifier())
+        err, ax_windows = fns['AXUIElementCopyAttributeValue'](app_ref, 'AXWindows', None)
+        if err == 0 and ax_windows:
+            for w in ax_windows:
+                if match_fn(w, fns):
+                    fns['AXUIElementPerformAction'](w, 'AXRaise')
+                    running_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+                    return True
+    except Exception:
+        pass
+    # Fallback: just activate
+    running_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
+    return False
+
+
+def _find_running_app_by_bundle(bundle_id):
+    """Find NSRunningApplication by bundle identifier (cached)."""
+    cached = _running_app_cache.get(bundle_id)
+    if cached and not cached.isTerminated():
+        return cached
+    for a in NSWorkspace.sharedWorkspace().runningApplications():
+        if a.bundleIdentifier() == bundle_id:
+            _running_app_cache[bundle_id] = a
+            return a
+    return None
 
 
 def _get_screen_bounds():
@@ -1057,6 +1094,11 @@ def _tile_if_overlapping_from_bounds(raw, window_ids, app="iTerm2"):
 
 
 def raise_app_windows(window_ids, app="iTerm2"):
+    """Raise specific windows by ID in a scriptable app.
+
+    Same pattern as raise_app_window but for multiple windows:
+    AppleScript reorders target windows, then AXRaise top N + activate.
+    """
     from Foundation import NSAppleScript
 
     # Read bounds of target windows before raising (for overlap tiling)
@@ -1076,29 +1118,14 @@ def raise_app_windows(window_ids, app="iTerm2"):
     else:
         bounds_raw = ""
 
-    # Activate early so macOS starts bringing app forward in parallel
-    running_app = _find_running_app(app)
-    if running_app:
-        running_app.activateWithOptions_(NSApplicationActivateIgnoringOtherApps)
-
-    # Set index for each target window individually (faster than looping all windows)
+    # AppleScript to reorder target windows to front within the app
     set_cmds = "\n".join(f'set index of window id {wid} to 1' for wid in window_ids)
     script = NSAppleScript.alloc().initWithSource_(
         f'tell application "{app}"\n{set_cmds}\nend tell')
     script.executeAndReturnError_(None)
 
-    # AXRaise only the target windows
-    if running_app:
-        try:
-            fns = _get_ax_fns()
-            app_ref = fns['AXUIElementCreateApplication'](running_app.processIdentifier())
-            err, ax_windows = fns['AXUIElementCopyAttributeValue'](app_ref, 'AXWindows', None)
-            if err == 0 and ax_windows:
-                n = min(len(window_ids), len(ax_windows))
-                for i in range(n - 1, -1, -1):
-                    fns['AXUIElementPerformAction'](ax_windows[i], 'AXRaise')
-        except Exception:
-            pass
+    # AXRaise top N + activate (same pattern as single-window raise)
+    _ax_raise_n_and_activate(app, len(window_ids))
 
     # Tile overlapping windows apart (only moves target windows)
     if bounds_raw:
@@ -1106,58 +1133,55 @@ def raise_app_windows(window_ids, app="iTerm2"):
 
 
 def _raise_companion_app(bundle_id, app_name, proj_path):
-    """Activate companion app and try to raise the window matching the project."""
-    # Convert POSIX proj_path to HFS-style suffix for matching
-    # e.g. /Users/kevin/Desktop/poly -> :Users:kevin:Desktop:poly:
-    hfs_suffix = ":" + proj_path.lstrip("/").replace("/", ":") + ":"
+    """Raise only the matching companion app window without bringing all windows forward.
+
+    For scriptable apps (BBEdit, Finder): AppleScript selects/reorders the target window
+    within the app, then _ax_raise_and_activate brings just that window forward.
+    For non-scriptable apps (PyCharm): _ax_raise_matching_window finds and raises
+    the window by AX title attribute.
+    """
+    from Foundation import NSAppleScript
+
     if app_name == "BBEdit":
-        # Find a document whose HFS path contains the project directory
-        script = f'''tell application "BBEdit"
-activate
+        hfs_suffix = ":" + proj_path.lstrip("/").replace("/", ":") + ":"
+        script = NSAppleScript.alloc().initWithSource_(f'''tell application "BBEdit"
 set dl to every text document
 repeat with i from 1 to count of dl
 try
 set f to file of (item i of dl)
 if (f as text) contains "{hfs_suffix}" then
 tell (item i of dl) to select
-return
+exit repeat
 end if
 end try
 end repeat
-end tell'''
-        run_osascript(script)
+end tell''')
+        script.executeAndReturnError_(None)
+        _ax_raise_and_activate("BBEdit")
+
     elif app_name == "Finder":
-        # Activate Finder and raise the window showing this path
-        script = f'''tell application "Finder"
-activate
+        script = NSAppleScript.alloc().initWithSource_(f'''tell application "Finder"
 set n to count of Finder windows
 repeat with i from 1 to n
 try
 set p to POSIX path of (target of Finder window i as alias)
 if p starts with "{proj_path}" then
 set index of Finder window i to 1
-return
+exit repeat
 end if
 end try
 end repeat
-end tell'''
-        run_osascript(script)
+end tell''')
+        script.executeAndReturnError_(None)
+        _ax_raise_and_activate("Finder")
+
     elif app_name == "PyCharm":
-        # PyCharm window titles start with project name — raise the matching window
         proj_basename = os.path.basename(proj_path)
-        script = f'''tell application "System Events"
-set p to first process whose bundle identifier is "{bundle_id}"
-set frontmost of p to true
-repeat with w in every window of p
-if name of w starts with "{proj_basename}" then
-perform action "AXRaise" of w
-return
-end if
-end repeat
-end tell'''
-        result = run_osascript(script)
-        if result == "" and proj_basename:
-            _clog("PyCharm AXRaise may have failed for '%s' — check Accessibility permissions" % proj_basename)
+        def _match_pycharm(w, fns):
+            err, title = fns['AXUIElementCopyAttributeValue'](w, 'AXTitle', None)
+            return err == 0 and title and str(title).startswith(proj_basename)
+        _ax_raise_matching_window(bundle_id, _match_pycharm)
+
     else:
         subprocess.run(["open", "-b", bundle_id], capture_output=True, timeout=5)
 
