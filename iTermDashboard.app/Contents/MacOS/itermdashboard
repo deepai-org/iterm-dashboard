@@ -1782,16 +1782,17 @@ def match_apps_to_projects(companion_paths, project_paths):
     for app_name, paths in companion_paths.items():
         info = COMPANION_APPS[app_name]
         for path in paths:
+            norm_path = path.rstrip("/")
             if info.get("parse") == "window_title":
                 # Match PyCharm project name against project directory basename
                 for proj_path in project_paths:
                     proj_name = os.path.basename(proj_path)
-                    if path.lower() == proj_name.lower():
+                    if norm_path.lower() == proj_name.lower():
                         matches[proj_path].add(app_name)
             else:
                 # Match file/folder path against project directories
                 for proj_path in project_paths:
-                    if path.startswith(proj_path + "/") or path.rstrip("/") == proj_path.rstrip("/"):
+                    if norm_path.startswith(proj_path + "/") or norm_path == proj_path.rstrip("/"):
                         matches[proj_path].add(app_name)
     result = {k: sorted(v) for k, v in matches.items()}
     _clog("Match results: %s" % str(result))
@@ -1823,17 +1824,15 @@ def collect_menu_data(prev_snapshot=None):
             sessions.extend(terminal_sessions)
     except Exception:
         pass
-    if not sessions:
-        return None, {}, {}, None
-
-    enrich_sessions(sessions)
+    if sessions:
+        enrich_sessions(sessions)
 
     home = os.path.expanduser("~")
     projects = defaultdict(list)  # keyed by git_root or cwd
     unassigned = []
     git_root_cache = {}  # cwd -> git_root or None
 
-    for s in sessions:
+    for s in (sessions or []):
         if not s.cwd or s.cwd == home:
             unassigned.append(s)
         else:
@@ -1842,6 +1841,63 @@ def collect_menu_data(prev_snapshot=None):
                 git_root_cache[cwd] = find_git_root(cwd)
             root = git_root_cache[cwd] or cwd
             projects[root].append(s)
+
+    # Query companion apps early so we can add terminal-less projects
+    companion_paths = get_companion_app_paths()
+    companion_only_apps = defaultdict(set)  # project_path -> {app_names}
+    _companion_git_cache = {}  # dir_path -> git_root or None
+
+    def _cached_git_root(dir_path):
+        if dir_path not in _companion_git_cache:
+            _companion_git_cache[dir_path] = find_git_root(dir_path)
+        return _companion_git_cache[dir_path]
+
+    # Process Finder first (folder paths, quick), then others
+    for app_name in ["Finder", "BBEdit", "PyCharm"]:
+        if app_name not in companion_paths:
+            continue
+        paths = companion_paths[app_name]
+        info = COMPANION_APPS[app_name]
+
+        if info.get("parse") == "window_title":
+            # PyCharm: match project name against existing projects first
+            for path in paths:
+                matched = False
+                for proj_path in list(projects.keys()):
+                    if path.lower() == os.path.basename(proj_path).lower():
+                        matched = True
+                        break
+                if matched:
+                    continue
+                # Try to find project dir by scanning common locations
+                for parent in [home + "/Desktop", home + "/Documents", home + "/Projects", home + "/dev", home]:
+                    candidate = os.path.join(parent, path)
+                    if os.path.isdir(candidate):
+                        git_root = _cached_git_root(candidate)
+                        proj = git_root or candidate
+                        if proj not in projects:
+                            projects[proj]  # ensure key exists with empty list
+                        companion_only_apps[proj].add(app_name)
+                        break
+        else:
+            # Finder / BBEdit: resolve git root from the path
+            # Deduplicate directories to avoid redundant git root lookups
+            seen_dirs = set()
+            for path in paths:
+                check_path = path.rstrip("/") if os.path.isdir(path) else os.path.dirname(path)
+                if check_path in seen_dirs:
+                    continue
+                seen_dirs.add(check_path)
+                if not os.path.exists(check_path):
+                    continue
+                git_root = _cached_git_root(check_path)
+                if git_root:
+                    if git_root not in projects:
+                        projects[git_root]  # ensure key exists with empty list
+                    companion_only_apps[git_root].add(app_name)
+
+    if not sessions and not projects:
+        return None, {}, {}, None
 
     def oldest_session_age(sess_list):
         max_age = 0
@@ -1867,7 +1923,7 @@ def collect_menu_data(prev_snapshot=None):
     remote_sessions = []
     prod_sessions = []
 
-    for s in sessions:
+    for s in (sessions or []):
         if s.is_claude:
             total_claude += 1
             total_claude_mem += s.mem_kb
@@ -1885,13 +1941,18 @@ def collect_menu_data(prev_snapshot=None):
             prod_sessions.append(s)
 
     # Build snapshot and compute deltas
-    snapshot = _compute_snapshot(sessions, sorted_projects, git_statuses, total_claude, total_claude_mem)
+    snapshot = _compute_snapshot(sessions or [], sorted_projects, git_statuses, total_claude, total_claude_mem)
     deltas = _compute_deltas(prev_snapshot, snapshot, sorted_projects, git_statuses)
 
-    # Query companion apps (BBEdit, PyCharm, Finder) and match to projects
+    # Match companion apps to projects (companion_paths already queried above)
     project_paths = [path for path, _ in sorted_projects]
-    companion_paths = get_companion_app_paths()
     project_apps = match_apps_to_projects(companion_paths, project_paths)
+    # Merge in companion-only app associations
+    for proj_path, apps in companion_only_apps.items():
+        if proj_path in project_apps:
+            project_apps[proj_path] = sorted(set(project_apps[proj_path]) | apps)
+        else:
+            project_apps[proj_path] = sorted(apps)
 
     data = {
         "projects": [],
@@ -1916,7 +1977,7 @@ def collect_menu_data(prev_snapshot=None):
 
         proj_tag = tag_counter
         tag_counter += 1
-        proj_app = sess_list[0].app_source if sess_list else "iTerm2"
+        proj_app = sess_list[0].app_source if sess_list else "Finder"
         proj_window_ids = [s.window_id for s in sess_list]
         project_window_map[proj_tag] = (proj_window_ids, proj_app)
 
@@ -2130,10 +2191,10 @@ def collect_menu_data(prev_snapshot=None):
         if len(subdirs) > 1:
             data["insights"].append(f"[i] {os.path.basename(proj_path)}: {len(subdirs)} sub-projects active")
 
-    shell_count = sum(1 for s in sessions if s.role == "shell")
+    shell_count = sum(1 for s in (sessions or []) if s.role == "shell")
     remote_count = len(remote_sessions)
     data["summary_segments"] = [
-        (f"{len(sessions)}", BOLD_SM, CLR_ACCENT),
+        (f"{len(sessions or [])}", BOLD_SM, CLR_ACCENT),
         (" win ", MONO_SM, CLR_DIM),
         ("\u2502", MONO_SM, CLR_DIM),
         (f" {total_claude}", BOLD_SM, CLR_PURPLE),
