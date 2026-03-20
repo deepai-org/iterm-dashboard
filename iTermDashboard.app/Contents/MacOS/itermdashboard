@@ -1139,11 +1139,14 @@ def _raise_companion_app(bundle_id, app_name, proj_path):
     within the app, then _ax_raise_and_activate brings just that window forward.
     For non-scriptable apps (PyCharm): _ax_raise_matching_window finds and raises
     the window by AX title attribute.
+
+    If no matching window is found (stale data), falls back to opening a new one.
     """
     from Foundation import NSAppleScript
 
     if app_name == "BBEdit":
         hfs_suffix = ":" + proj_path.lstrip("/").replace("/", ":") + ":"
+        # Return "found" or "" to detect if a matching doc exists
         script = NSAppleScript.alloc().initWithSource_(f'''tell application "BBEdit"
 set dl to every text document
 repeat with i from 1 to count of dl
@@ -1151,13 +1154,18 @@ try
 set f to file of (item i of dl)
 if (f as text) contains "{hfs_suffix}" then
 tell (item i of dl) to select
-exit repeat
+return "found"
 end if
 end try
 end repeat
+return ""
 end tell''')
-        script.executeAndReturnError_(None)
-        _ax_raise_and_activate("BBEdit")
+        result, err = script.executeAndReturnError_(None)
+        found = result and result.stringValue() == "found"
+        if found:
+            _ax_raise_and_activate("BBEdit")
+        else:
+            _open_companion_app(bundle_id, app_name, proj_path)
 
     elif app_name == "Finder":
         script = NSAppleScript.alloc().initWithSource_(f'''tell application "Finder"
@@ -1167,23 +1175,52 @@ try
 set p to POSIX path of (target of Finder window i as alias)
 if p starts with "{proj_path}" then
 set index of Finder window i to 1
-exit repeat
+return "found"
 end if
 end try
 end repeat
+return ""
 end tell''')
-        script.executeAndReturnError_(None)
-        _ax_raise_and_activate("Finder")
+        result, err = script.executeAndReturnError_(None)
+        found = result and result.stringValue() == "found"
+        if found:
+            _ax_raise_and_activate("Finder")
+        else:
+            _open_companion_app(bundle_id, app_name, proj_path)
 
     elif app_name == "PyCharm":
         proj_basename = os.path.basename(proj_path)
         def _match_pycharm(w, fns):
             err, title = fns['AXUIElementCopyAttributeValue'](w, 'AXTitle', None)
             return err == 0 and title and str(title).startswith(proj_basename)
-        _ax_raise_matching_window(bundle_id, _match_pycharm)
+        if not _ax_raise_matching_window(bundle_id, _match_pycharm):
+            _open_companion_app(bundle_id, app_name, proj_path)
 
     else:
         subprocess.run(["open", "-b", bundle_id], capture_output=True, timeout=5)
+
+
+def _open_new_terminal(cwd, app="iTerm2"):
+    """Open a new terminal window in the given directory."""
+    from Foundation import NSAppleScript
+    escaped = cwd.replace('"', '\\"')
+    if app in ("iTerm2", "Nexus"):
+        script = NSAppleScript.alloc().initWithSource_(f'''
+tell application "{app}"
+    activate
+    set newWindow to (create window with default profile)
+    tell current session of newWindow
+        write text "cd \\"{escaped}\\""
+    end tell
+end tell''')
+        script.executeAndReturnError_(None)
+    elif app == "Terminal":
+        script = NSAppleScript.alloc().initWithSource_(f'''
+tell application "Terminal"
+    activate
+    do script "cd \\"{escaped}\\""
+end tell''')
+        script.executeAndReturnError_(None)
 
 
 def _open_companion_app(bundle_id, app_name, folder_path):
@@ -2308,7 +2345,7 @@ def collect_menu_data(prev_snapshot=None):
             segments = build_session_segments(s, is_last_in_group)
             s_tag = tag_counter
             tag_counter += 1
-            session_map[s_tag] = (s.window_id, s.app_source)
+            session_map[s_tag] = (s.window_id, s.app_source, s.cwd)
 
             # Build rich tooltip
             proc_names = [p["cmd"].split()[0] for p in s.processes
@@ -2470,6 +2507,30 @@ class FlippedView(NSView):
     """An NSView subclass with flipped coordinates (origin at top-left)."""
     def isFlipped(self):
         return True
+
+
+class HoverButton(NSButton):
+    """An NSButton that brightens on hover and shows a pointing hand cursor."""
+
+    def initWithFrame_(self, frame):
+        self = objc.super(HoverButton, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        tracking = NSTrackingArea.alloc().initWithRect_options_owner_userInfo_(
+            NSZeroRect,
+            0x01 | 0x80 | 0x200,  # mouseEnteredAndExited | activeAlways | inVisibleRect
+            self, None,
+        )
+        self.addTrackingArea_(tracking)
+        self._base_alpha = 1.0
+        return self
+
+    def mouseEntered_(self, event):
+        # Brighten: ghost buttons go from 0.25 to 0.7, solid stay at 1.0
+        self.setAlphaValue_(min(self._base_alpha + 0.45, 1.0))
+
+    def mouseExited_(self, event):
+        self.setAlphaValue_(self._base_alpha)
 
 
 class ClickableRow(FlippedView):
@@ -2657,24 +2718,23 @@ def build_sidebar_content(data, delegate):
             app_icon = app_icon.copy()
             app_icon.setSize_((badge_size, badge_size))
             is_present = app_name in existing_apps
-            btn = NSButton.alloc().initWithFrame_(NSMakeRect(badge_x, badge_y, badge_size, badge_size))
+            btn = HoverButton.alloc().initWithFrame_(NSMakeRect(badge_x, badge_y, badge_size, badge_size))
             btn.setImage_(app_icon)
             btn.setBordered_(False)
             btn.setTarget_(delegate)
+            c_tag = delegate._next_companion_tag
+            delegate._next_companion_tag += 1
+            btn.setTag_(c_tag)
             if is_present:
                 btn.setToolTip_(app_name)
                 btn.setAction_(objc.selector(delegate.companionClicked_, signature=b'v@:@'))
-                c_tag = delegate._next_companion_tag
-                delegate._next_companion_tag += 1
-                btn.setTag_(c_tag)
                 delegate._companion_map[c_tag] = (info["bundle"], app_name, folder_path)
+                btn._base_alpha = 1.0
             else:
+                btn._base_alpha = 0.25
                 btn.setAlphaValue_(0.25)
                 btn.setToolTip_(f"Open in {app_name}")
                 btn.setAction_(objc.selector(delegate.openCompanionClicked_, signature=b'v@:@'))
-                c_tag = delegate._next_companion_tag
-                delegate._next_companion_tag += 1
-                btn.setTag_(c_tag)
                 delegate._open_companion_map[c_tag] = (info["bundle"], app_name, folder_path)
             row.addSubview_(btn)
 
@@ -3343,7 +3403,7 @@ class AppDelegate(NSObject):
         with self._lock:
             entry = self._session_map.get(tag)
         if entry is not None:
-            window_id, app = entry
+            window_id, app, cwd = entry
             threading.Thread(target=raise_app_window, args=(window_id, app), daemon=True).start()
 
     def projectClicked_(self, sender):
