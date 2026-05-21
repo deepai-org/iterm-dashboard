@@ -6,6 +6,7 @@ import json
 import re
 import os
 import time
+import base64
 import threading
 from itertools import permutations, product
 from collections import defaultdict
@@ -66,6 +67,9 @@ class Session:
     remote_type: str = ""  # ssh|kubectl|docker|psql|mysql|mosh|et
     remote_target: str = ""
     is_production: bool = False
+    # Dev VM association
+    devvm_session_name: str = ""  # ET session name extracted from base64 bootstrap
+    devvm_name: str = ""  # VM name (set during correlation with dev-vm API)
     # Source app for raise-to-front
     app_source: str = "iTerm2"  # "iTerm2", "Nexus", or "Terminal"
 
@@ -99,6 +103,118 @@ class RefreshSnapshot:
     project_dirty: dict = field(default_factory=dict)  # path -> dirty count
     total_claude: int = 0
     total_claude_mem_kb: int = 0
+
+
+@dataclass
+class DevVmSession:
+    name: str = ""
+    status: str = ""  # attached|detached|dead
+    clients: int = 0
+    created_at: str = ""
+    last_connected: str = ""
+    connect_count: int = 0
+    on_remote: bool = False
+
+
+@dataclass
+class DevVmInfo:
+    vm_name: str = "default"
+    instance_id: str = ""
+    instance_type: str = ""
+    state: str = ""  # running|stopped|pending|stopping
+    ip: str = ""
+    proxy: str = ""
+    sessions: list = field(default_factory=list)  # [DevVmSession, ...]
+
+
+# ── Dev VM CLI ────────────────────────────────────────────────────────────────
+
+DEV_VM_CLI = os.path.expanduser("~/Desktop/ml_made_fun/dev-vm")
+
+
+def _devvm_cmd(*args, vm=None, timeout=5):
+    """Call dev-vm CLI with --json, return parsed dict or None on failure."""
+    if not os.path.isfile(DEV_VM_CLI):
+        return None
+    cmd = [DEV_VM_CLI, "--json"]
+    if vm:
+        cmd += ["--vm", vm]
+    cmd += list(args)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if r.returncode != 0:
+            return None
+        return json.loads(r.stdout)
+    except Exception:
+        return None
+
+
+def get_devvm_info():
+    """Collect dev VM status and ET sessions. Returns list of DevVmInfo."""
+    vms_data = _devvm_cmd("list", timeout=10)
+    if not vms_data or not vms_data.get("instances"):
+        return []
+
+    results = []
+    username = os.environ.get("USER", "")
+    for inst in vms_data["instances"]:
+        vm_name_tag = inst.get("name", "")
+        # Extract vm_name from EC2 tag: "dev-vm-kevin" -> "default", "dev-vm-kevin-foo" -> "foo"
+        # Strip "dev-vm-{username}" prefix, remainder after "-" is the vm name
+        base_prefix = f"dev-vm-{username}"
+        if vm_name_tag == base_prefix:
+            vm_name = "default"
+        elif vm_name_tag.startswith(base_prefix + "-"):
+            vm_name = vm_name_tag[len(base_prefix) + 1:]
+        else:
+            # Not our VM (different user) — skip
+            continue
+
+        info = DevVmInfo(
+            vm_name=vm_name,
+            instance_id=inst.get("instance_id", ""),
+            instance_type=inst.get("instance_type", ""),
+            state=inst.get("state", ""),
+            ip=inst.get("ip") or "",
+        )
+
+        # Fetch ET sessions for running VMs
+        if info.state == "running" and info.ip:
+            sess_data = _devvm_cmd("et", "--list", vm=vm_name if vm_name != "default" else None, timeout=15)
+            if sess_data and sess_data.get("sessions"):
+                for s in sess_data["sessions"]:
+                    info.sessions.append(DevVmSession(
+                        name=s.get("name", ""),
+                        status=s.get("status", ""),
+                        clients=s.get("clients", 0),
+                        created_at=s.get("created_at", ""),
+                        last_connected=s.get("last_connected", ""),
+                        connect_count=s.get("connect_count", 0),
+                        on_remote=s.get("on_remote", False),
+                    ))
+
+        results.append(info)
+    return results
+
+
+def _extract_et_session_name(full_cmd):
+    """Extract the dev-vm ET session name from a local et process command line.
+
+    The et command has -c "B64=<base64> bash -lc '...'" where the base64 decodes
+    to a script containing SESSION="<name>" near the top.
+    """
+    m = re.search(r'B64=(\S+)', full_cmd)
+    if not m:
+        return None
+    b64_val = m.group(1)
+    # Strip surrounding quotes if present
+    b64_val = b64_val.strip("'\"")
+    try:
+        decoded = base64.b64decode(b64_val).decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    sm = re.search(r'SESSION="([^"]+)"', decoded)
+    return sm.group(1) if sm else None
 
 
 # ── Subprocess helpers ────────────────────────────────────────────────────────
@@ -503,20 +619,38 @@ def _classify_role(cmd_base, full_cmd):
     return "shell"
 
 
+_FLAG_WITH_VALUE = {
+    # ssh/et/mosh flags that consume the next argument
+    "-i", "-o", "-F", "-l", "-p", "-J", "-W", "-w", "-b", "-c", "-D", "-e",
+    "-L", "-R", "-S", "-O", "-Q", "-E", "--ssh-option",
+}
+
+
 def _detect_remote(full_cmd):
     """Detect remote session context from a command string. Returns (type, target, is_prod)."""
     cmd_base = full_cmd.split()[0] if full_cmd else ""
     for pattern, rtype in REMOTE_PATTERNS:
         m = pattern.match(full_cmd)
         if m:
-            target = m.group(m.lastindex) if m.lastindex else ""
-            target = target.strip().split()[-1] if target.strip() else ""
+            # Extract the first non-flag argument as the target (host/user@host)
+            args = m.group(1).split() if m.lastindex else []
+            target = ""
+            skip_next = False
+            for arg in args:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if arg in _FLAG_WITH_VALUE:
+                    skip_next = True
+                    continue
+                if arg.startswith("-"):
+                    # Single flag like -v, -N, -T, or --flag=value
+                    continue
+                target = arg
+                break
             # Strip user@ from ssh targets
             if "@" in target:
                 target = target.split("@")[-1]
-            # Remove flags
-            if target.startswith("-"):
-                target = ""
             is_prod = any(kw in full_cmd.lower() for kw in PROD_KEYWORDS)
             return rtype, target, is_prod
     return "", "", False
@@ -602,6 +736,11 @@ def enrich_sessions(sessions):
                     sess.remote_target = rtarget
                     sess.is_production = is_prod
                     sess.role = "remote"
+                    # Extract dev-vm ET session name from base64 bootstrap
+                    if rtype == "et" and "B64=" in fg_full:
+                        et_name = _extract_et_session_name(fg_full)
+                        if et_name:
+                            sess.devvm_session_name = et_name
                 else:
                     sess.role = _classify_role(fg_base, fg_full)
         elif not procs:
@@ -2055,6 +2194,32 @@ end tell''')
     script.executeAndReturnError_(None)
 
 
+def cleanup_devvm_dead_sessions(session_names, vm_name):
+    """Kill dead ET sessions on a dev VM."""
+    vm_arg = vm_name if vm_name != "default" else None
+    for name in session_names:
+        _devvm_cmd("et", "--kill", name, vm=vm_arg, timeout=10)
+
+
+def connect_devvm_session(session_name, vm_name):
+    """Open a new iTerm2 window and connect to a dev-vm ET session."""
+    from Foundation import NSAppleScript
+    escaped_name = session_name.replace('"', '\\"')
+    vm_flag = ""
+    if vm_name and vm_name != "default":
+        escaped_vm = vm_name.replace('"', '\\"')
+        vm_flag = f' --vm \\"{escaped_vm}\\"'
+    script = NSAppleScript.alloc().initWithSource_(f'''
+tell application "iTerm2"
+    activate
+    set newWindow to (create window with default profile)
+    tell current session of newWindow
+        write text "cd ~/Desktop/ml_made_fun && ./dev-vm{vm_flag} et \\"{escaped_name}\\""
+    end tell
+end tell''')
+    script.executeAndReturnError_(None)
+
+
 def collect_menu_data(prev_snapshot=None):
     """Collect all data. Returns (data, session_map, project_window_map, snapshot)."""
     sessions = get_iterm_sessions()
@@ -2082,6 +2247,48 @@ def collect_menu_data(prev_snapshot=None):
         pass
     if sessions:
         enrich_sessions(sessions)
+
+    # ── Dev VM integration ──
+    devvm_list = get_devvm_info()
+    devvm_ip_map = {}  # ip -> DevVmInfo
+    for vm in devvm_list:
+        if vm.ip:
+            devvm_ip_map[vm.ip] = vm
+    # Correlate iTerm sessions with dev VMs by IP match
+    # Also collect locally-observed attached session names to correct stale API data
+    local_attached = {}  # vm_ip -> set of session names seen in local iTerm process tree
+    # Map (vm_ip, session_name) -> (window_id, app_source) for raise-to-front
+    local_et_windows = {}
+    for s in (sessions or []):
+        if s.remote_type in ("et", "ssh") and s.remote_target:
+            vm = devvm_ip_map.get(s.remote_target)
+            if vm:
+                s.devvm_name = vm.vm_name
+                # If we got an ET session name from base64, use it for display
+                if s.devvm_session_name:
+                    local_attached.setdefault(vm.ip, set()).add(s.devvm_session_name)
+                    local_et_windows[(vm.ip, s.devvm_session_name)] = (s.window_id, s.app_source)
+                    s.remote_target = s.devvm_session_name
+
+    # Override stale API status with local evidence: if we see a live iTerm et
+    # session matched to a VM session, it's attached (even if et --list timed out
+    # or SSH check failed on slow network)
+    for vm in devvm_list:
+        attached_names = local_attached.get(vm.ip, set())
+        if not attached_names:
+            continue
+        existing_names = {s.name for s in vm.sessions}
+        for vs in vm.sessions:
+            if vs.name in attached_names:
+                vs.status = "attached"
+                vs.clients = max(vs.clients, 1)
+                vs.on_remote = True
+        # Add sessions we see locally but that et --list didn't return
+        # (e.g., API timed out entirely, or S3 has no record yet)
+        for name in attached_names - existing_names:
+            vm.sessions.append(DevVmSession(
+                name=name, status="attached", clients=1, on_remote=True,
+            ))
 
     home = os.path.expanduser("~")
     projects = defaultdict(list)  # keyed by git_root or cwd
@@ -2242,6 +2449,8 @@ def collect_menu_data(prev_snapshot=None):
         "insights": [],
         "deltas": deltas,
         "summary_segments": [],
+        "devvms": devvm_list,
+        "devvm_et_windows": local_et_windows,
     }
 
     session_map = {}
@@ -2360,6 +2569,10 @@ def collect_menu_data(prev_snapshot=None):
                 tooltip += f"\nForeground: {s.fg_command} {s.fg_args}"
             if s.remote_type:
                 tooltip += f"\nRemote: {s.remote_type} {s.remote_target}"
+            if s.devvm_name:
+                tooltip += f"\nDev VM: {s.devvm_name}"
+                if s.devvm_session_name:
+                    tooltip += f" (session: {s.devvm_session_name})"
             if s.idle_secs > 60:
                 tooltip += f"\nIdle: {format_age(s.idle_secs)}"
             if proc_names:
@@ -2467,6 +2680,20 @@ def collect_menu_data(prev_snapshot=None):
     if old_claude:
         data["insights"].append(f"[i] {len(old_claude)} Claude instances >5d old")
 
+    # Dev VM insights
+    for vm in devvm_list:
+        vm_label = vm.vm_name if vm.vm_name != "default" else "Dev VM"
+        if vm.state == "running":
+            detached = [s for s in vm.sessions if s.status == "detached"]
+            dead = [s for s in vm.sessions if s.status == "dead"]
+            if detached:
+                names = ", ".join(s.name for s in detached)
+                data["insights"].append(f"[i] {vm_label}: {len(detached)} detached session{'s' if len(detached) > 1 else ''} ({names})")
+            if dead:
+                data["insights"].append(f"[!] {vm_label}: {len(dead)} dead session{'s' if len(dead) > 1 else ''}")
+        elif vm.state == "stopped":
+            data["insights"].append(f"[i] {vm_label}: stopped ({vm.instance_type})")
+
     # Detect repos with multiple sub-project dirs open
     for proj_path, sess_list in sorted_projects:
         subdirs = set()
@@ -2500,6 +2727,13 @@ def collect_menu_data(prev_snapshot=None):
             ("\u2502", MONO_SM, CLR_DIM),
             (f" {total_lsp}", BOLD_SM, CLR_ACCENT),
             (" LSP", MONO_SM, CLR_DIM),
+        ]
+    running_vms = [vm for vm in devvm_list if vm.state == "running"]
+    if running_vms:
+        data["summary_segments"] += [
+            ("\u2502", MONO_SM, CLR_DIM),
+            (f" {len(running_vms)}", BOLD_SM, CLR_CYAN),
+            (" VM", MONO_SM, CLR_DIM),
         ]
 
     return data, session_map, project_window_map, snapshot
@@ -2701,6 +2935,8 @@ def build_sidebar_content(data, delegate):
     delegate._companion_map = {}
     delegate._open_companion_map = {}
     delegate._resume_map = {}
+    delegate._devvm_connect_map = {}
+    delegate._devvm_cleanup_map = {}
     delegate._next_companion_tag = 10000
     _resume_tag_counter = 20000
 
@@ -2909,6 +3145,156 @@ def build_sidebar_content(data, delegate):
             ))
         rows.append(_build_separator())
 
+    # ── Dev VMs ──
+    devvms = data.get("devvms", [])
+    if devvms:
+        _devvm_tag_counter = 30000
+        rows.append(_build_sidebar_row(
+            [("DEV VMs", BOLD, CLR_LABEL), (f"  ({len(devvms)})", MONO_SM, CLR_DIM)],
+            icon=sf_symbol("server.rack", color=CLR_CYAN, size=11.0),
+            is_header=True,
+        ))
+        rows.append(_build_separator())
+
+        for vi, vm in enumerate(devvms):
+            vm_label = vm.vm_name if vm.vm_name != "default" else "dev-vm"
+            # State badge
+            if vm.state == "running":
+                state_seg = ("\u25CF running", BOLD_SM, CLR_GREEN)
+            elif vm.state == "stopped":
+                state_seg = ("\u25CB stopped", MONO_SM, CLR_DIM)
+            elif vm.state == "pending":
+                state_seg = ("\u25D4 pending", MONO_SM, CLR_ORANGE)
+            elif vm.state == "stopping":
+                state_seg = ("\u25D4 stopping", MONO_SM, CLR_ORANGE)
+            else:
+                state_seg = (vm.state or "unknown", MONO_SM, CLR_DIM)
+
+            vm_segs = [
+                (vm_label, BOLD, CLR_ACCENT),
+                ("  ", MONO_SM, None),
+                state_seg,
+            ]
+            vm_tooltip = f"VM: {vm.vm_name}\nInstance: {vm.instance_id}\nType: {vm.instance_type}\nState: {vm.state}\nIP: {vm.ip or 'N/A'}"
+            has_detail = bool(vm.sessions) or vm.ip
+            rows.append(_build_sidebar_row(
+                vm_segs,
+                icon=sf_symbol("desktopcomputer", color=CLR_CYAN, size=11.0),
+                tooltip=vm_tooltip,
+            ))
+            # Detail row: instance type + IP
+            detail_segs = [(vm.instance_type, MONO_SM, CLR_DIM)]
+            if vm.ip:
+                detail_segs += [("  ", MONO_SM, None), (vm.ip, MONO_SM, CLR_DIM)]
+            rows.append(_build_sidebar_row(
+                detail_segs,
+                indent=1,
+                tree_lines=[(1, "mid" if has_detail else "last")],
+            ))
+
+            # ET sessions for this VM
+            has_dead = any(s.status == "dead" for s in vm.sessions)
+            if vm.sessions:
+                for si, s in enumerate(vm.sessions):
+                    is_last = (si == len(vm.sessions) - 1)
+                    if s.status == "attached":
+                        status_seg = ("\u25C9 attached", BOLD_SM, CLR_GREEN)
+                    elif s.status == "detached":
+                        status_seg = ("\u25CB detached", MONO_SM, CLR_ORANGE)
+                    elif s.status == "unknown":
+                        status_seg = ("? unknown", MONO_SM, CLR_ORANGE)
+                    else:
+                        status_seg = ("\u2717 dead", MONO_SM, CLR_RED)
+
+                    age_str = ""
+                    if s.last_connected:
+                        try:
+                            from datetime import datetime
+                            lc = datetime.fromisoformat(s.last_connected)
+                            age_secs = int((datetime.now() - lc).total_seconds())
+                            if age_secs > 0:
+                                age_str = format_age(age_secs)
+                        except Exception:
+                            pass
+
+                    sess_segs = [
+                        (s.name, BOLD_SM, CLR_SECONDARY),
+                        ("  ", MONO_SM, None),
+                        status_seg,
+                    ]
+                    if s.clients > 0:
+                        sess_segs += [("  ", MONO_SM, None), (f"{s.clients} client{'s' if s.clients > 1 else ''}", MONO_SM, CLR_DIM)]
+                    if age_str:
+                        sess_segs += [("  ", MONO_SM, None), (age_str, MONO_SM, CLR_DIM)]
+
+                    # Click action depends on status + whether we have a local window
+                    et_windows = data.get("devvm_et_windows", {})
+                    local_win = et_windows.get((vm.ip, s.name))
+                    cb = None
+                    cb_delegate = None
+                    s_tag = 0
+                    if local_win and s.status == "attached":
+                        # Raise existing iTerm window
+                        s_tag = _devvm_tag_counter
+                        _devvm_tag_counter += 1
+                        delegate._session_map[s_tag] = (local_win[0], local_win[1], None)
+                        cb = "sessionClicked_"
+                        cb_delegate = delegate
+                    elif s.status in ("detached", "unknown"):
+                        # Open new connection
+                        s_tag = _devvm_tag_counter
+                        _devvm_tag_counter += 1
+                        delegate._devvm_connect_map[s_tag] = (s.name, vm.vm_name)
+                        cb = "devvmConnectClicked_"
+                        cb_delegate = delegate
+
+                    tooltip = f"Session: {s.name}\nStatus: {s.status}\nClients: {s.clients}\nConnections: {s.connect_count}"
+                    if s.created_at:
+                        tooltip += f"\nCreated: {s.created_at}"
+                    if s.last_connected:
+                        tooltip += f"\nLast connected: {s.last_connected}"
+                    if local_win and s.status == "attached":
+                        tooltip += "\n\nClick to focus window"
+                    elif s.status in ("detached", "unknown"):
+                        tooltip += "\n\nClick to connect"
+
+                    # Last session gets "mid" tree line if cleanup row follows
+                    tree_last = is_last and not has_dead
+
+                    rows.append(_build_sidebar_row(
+                        sess_segs,
+                        indent=1,
+                        icon=sf_symbol(
+                            "bolt.fill" if s.status == "attached" else
+                            "questionmark.circle" if s.status == "unknown" else
+                            "arrow.counterclockwise" if s.status == "detached" else
+                            "xmark.circle",
+                            color=CLR_GREEN if s.status == "attached" else CLR_ORANGE if s.status in ("detached", "unknown") else CLR_RED,
+                            size=9.0,
+                        ),
+                        tag=s_tag, callback=cb, delegate=cb_delegate,
+                        tooltip=tooltip,
+                        tree_lines=[(1, "last" if tree_last else "mid")],
+                    ))
+
+                # "Clean up dead sessions" action
+                dead_sessions = [s for s in vm.sessions if s.status == "dead"]
+                if dead_sessions:
+                    cleanup_tag = _devvm_tag_counter
+                    _devvm_tag_counter += 1
+                    dead_names = [s.name for s in dead_sessions]
+                    delegate._devvm_cleanup_map[cleanup_tag] = (dead_names, vm.vm_name)
+                    rows.append(_build_sidebar_row(
+                        [(f"Clean up {len(dead_sessions)} dead session{'s' if len(dead_sessions) > 1 else ''}", MONO_SM, CLR_DIM)],
+                        indent=1,
+                        icon=sf_symbol("trash", color=CLR_DIM, size=9.0),
+                        tag=cleanup_tag, callback="devvmCleanupClicked_", delegate=delegate,
+                        tooltip=f"Kill dead sessions: {', '.join(dead_names)}",
+                        tree_lines=[(1, "last")],
+                    ))
+
+            rows.append(_build_separator())
+
     # ── Changes ──
     if data.get("deltas"):
         rows.append(_build_sidebar_row(
@@ -2988,6 +3374,8 @@ class AppDelegate(NSObject):
     _project_window_map = objc.ivar()
     _companion_map = objc.ivar()
     _resume_map = objc.ivar()
+    _devvm_connect_map = objc.ivar()
+    _devvm_cleanup_map = objc.ivar()
     _open_companion_map = objc.ivar()
     _next_companion_tag = objc.ivar()
     _prev_snapshot = objc.ivar()
@@ -3002,6 +3390,8 @@ class AppDelegate(NSObject):
         self._project_window_map = {}
         self._companion_map = {}
         self._resume_map = {}
+        self._devvm_connect_map = {}
+        self._devvm_cleanup_map = {}
         self._open_companion_map = {}
         self._next_companion_tag = 10000
         self._prev_snapshot = None
@@ -3296,6 +3686,8 @@ class AppDelegate(NSObject):
 
         # Clear maps that will be repopulated (sidebar clears its own in build_sidebar_content)
         self._resume_map = {}
+        self._devvm_connect_map = {}
+        self._devvm_cleanup_map = {}
 
         menu = NSMenu.alloc().init()
         menu.setDelegate_(self)
@@ -3428,6 +3820,105 @@ class AppDelegate(NSObject):
 
             menu.addItem_(NSMenuItem.separatorItem())
 
+        # ── Dev VMs ──
+        _menu_devvm_tag = 30000
+        devvms = data.get("devvms", [])
+        if devvms:
+            vm_header = rich_text([
+                ("DEV VMs", BOLD, CLR_LABEL),
+                (f"  ({len(devvms)})", MONO_SM, CLR_DIM),
+            ])
+            menu.addItem_(make_item(vm_header, image=sf_symbol("server.rack", color=CLR_CYAN, size=12.0)))
+
+            for vm in devvms:
+                vm_label = vm.vm_name if vm.vm_name != "default" else "dev-vm"
+                state_str = f"\u25CF {vm.state}" if vm.state == "running" else f"\u25CB {vm.state}"
+                state_clr = CLR_GREEN if vm.state == "running" else CLR_DIM
+                vm_segs = [
+                    (vm_label, BOLD_SM, CLR_ACCENT),
+                    ("  ", MONO_SM, None),
+                    (state_str, MONO_SM, state_clr),
+                ]
+                vm_text = rich_text(vm_segs)
+                menu.addItem_(make_item(vm_text, indent=1, image=sf_symbol("desktopcomputer", color=CLR_CYAN, size=11.0)))
+                # Detail line: instance type + IP
+                detail_segs = [(vm.instance_type, MONO_SM, CLR_DIM)]
+                if vm.ip:
+                    detail_segs += [("  ", MONO_SM, None), (vm.ip, MONO_SM, CLR_DIM)]
+                menu.addItem_(make_item(rich_text(detail_segs), indent=2))
+
+                for s in vm.sessions:
+                    if s.status == "attached":
+                        s_clr = CLR_GREEN
+                        s_icon = "bolt.fill"
+                        s_label = "\u25C9 attached"
+                    elif s.status == "detached":
+                        s_clr = CLR_ORANGE
+                        s_icon = "arrow.counterclockwise"
+                        s_label = "\u25CB detached"
+                    elif s.status == "unknown":
+                        s_clr = CLR_ORANGE
+                        s_icon = "questionmark.circle"
+                        s_label = "? unknown"
+                    else:
+                        s_clr = CLR_RED
+                        s_icon = "xmark.circle"
+                        s_label = "\u2717 dead"
+                    s_segs = [
+                        (s.name, BOLD_SM, CLR_SECONDARY),
+                        ("  ", MONO_SM, None),
+                        (s_label, MONO_SM, s_clr),
+                    ]
+                    s_text = rich_text(s_segs)
+                    et_windows = data.get("devvm_et_windows", {})
+                    local_win = et_windows.get((vm.ip, s.name))
+                    if local_win and s.status == "attached":
+                        # Raise existing window
+                        s_tag = _menu_devvm_tag
+                        _menu_devvm_tag += 1
+                        self._session_map[s_tag] = (local_win[0], local_win[1], None)
+                        item = make_item(
+                            s_text, indent=2,
+                            image=sf_symbol(s_icon, color=s_clr, size=10.0),
+                            action="sessionClicked:", target=self, tag=s_tag,
+                            tooltip=f"Focus window for '{s.name}'",
+                        )
+                        item.setEnabled_(True)
+                    elif s.status in ("detached", "unknown"):
+                        s_tag = _menu_devvm_tag
+                        _menu_devvm_tag += 1
+                        self._devvm_connect_map[s_tag] = (s.name, vm.vm_name)
+                        item = make_item(
+                            s_text, indent=2,
+                            image=sf_symbol(s_icon, color=s_clr, size=10.0),
+                            action="devvmConnectClicked:", target=self, tag=s_tag,
+                            tooltip=f"Click to connect to '{s.name}'",
+                        )
+                        item.setEnabled_(True)
+                    else:
+                        item = make_item(s_text, indent=2, image=sf_symbol(s_icon, color=s_clr, size=10.0))
+                    menu.addItem_(item)
+
+                # "Clean up dead" in menu
+                dead_sessions = [s for s in vm.sessions if s.status == "dead"]
+                if dead_sessions:
+                    cleanup_tag = _menu_devvm_tag
+                    _menu_devvm_tag += 1
+                    dead_names = [s.name for s in dead_sessions]
+                    self._devvm_cleanup_map[cleanup_tag] = (dead_names, vm.vm_name)
+                    cleanup_text = rich_text([
+                        (f"Clean up {len(dead_sessions)} dead session{'s' if len(dead_sessions) > 1 else ''}", MONO_SM, CLR_DIM),
+                    ])
+                    cleanup_item = make_item(
+                        cleanup_text, indent=2,
+                        image=sf_symbol("trash", color=CLR_DIM, size=10.0),
+                        action="devvmCleanupClicked:", target=self, tag=cleanup_tag,
+                    )
+                    cleanup_item.setEnabled_(True)
+                    menu.addItem_(cleanup_item)
+
+            menu.addItem_(NSMenuItem.separatorItem())
+
         # ── Changes Since Last Refresh ──
         if data.get("deltas"):
             changes_text = rich_text([("CHANGES", BOLD, CLR_LABEL)])
@@ -3524,6 +4015,28 @@ class AppDelegate(NSObject):
                 target=_open_companion_app, args=(bundle_id, app_name, folder_path),
                 daemon=True,
             ).start()
+
+    def devvmConnectClicked_(self, sender):
+        tag = sender.tag()
+        with self._lock:
+            entry = self._devvm_connect_map.get(tag)
+        if entry:
+            session_name, vm_name = entry
+            threading.Thread(
+                target=connect_devvm_session, args=(session_name, vm_name),
+                daemon=True,
+            ).start()
+
+    def devvmCleanupClicked_(self, sender):
+        tag = sender.tag()
+        with self._lock:
+            entry = self._devvm_cleanup_map.get(tag)
+        if entry:
+            session_names, vm_name = entry
+            def _cleanup_and_refresh():
+                cleanup_devvm_dead_sessions(session_names, vm_name)
+                self._start_refresh()
+            threading.Thread(target=_cleanup_and_refresh, daemon=True).start()
 
     def quitClicked_(self, sender):
         NSApplication.sharedApplication().terminate_(None)
