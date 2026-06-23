@@ -3203,6 +3203,8 @@ def build_sidebar_content(data, delegate):
                         status_seg = ("\u25CB detached", MONO_SM, CLR_ORANGE)
                     elif s.status == "unknown":
                         status_seg = ("? unknown", MONO_SM, CLR_ORANGE)
+                    elif s.status == "armed":
+                        status_seg = ("\u25c8 armed", BOLD_SM, CLR_CYAN)
                     else:
                         status_seg = ("\u2717 dead", MONO_SM, CLR_RED)
 
@@ -3240,8 +3242,8 @@ def build_sidebar_content(data, delegate):
                         delegate._session_map[s_tag] = (local_win[0], local_win[1], None)
                         cb = "sessionClicked_"
                         cb_delegate = delegate
-                    elif s.status in ("detached", "unknown"):
-                        # Open new connection
+                    elif s.status in ("detached", "unknown", "armed"):
+                        # Open new connection (armed: connecting fires the one-shot resume)
                         s_tag = _devvm_tag_counter
                         _devvm_tag_counter += 1
                         delegate._devvm_connect_map[s_tag] = (s.name, vm.vm_name)
@@ -3255,6 +3257,8 @@ def build_sidebar_content(data, delegate):
                         tooltip += f"\nLast connected: {s.last_connected}"
                     if local_win and s.status == "attached":
                         tooltip += "\n\nClick to focus window"
+                    elif s.status == "armed":
+                        tooltip += "\n\nClick to connect (auto-resumes saved session)"
                     elif s.status in ("detached", "unknown"):
                         tooltip += "\n\nClick to connect"
 
@@ -3268,8 +3272,9 @@ def build_sidebar_content(data, delegate):
                             "bolt.fill" if s.status == "attached" else
                             "questionmark.circle" if s.status == "unknown" else
                             "arrow.counterclockwise" if s.status == "detached" else
+                            "clock.arrow.circlepath" if s.status == "armed" else
                             "xmark.circle",
-                            color=CLR_GREEN if s.status == "attached" else CLR_ORANGE if s.status in ("detached", "unknown") else CLR_RED,
+                            color=CLR_GREEN if s.status == "attached" else CLR_CYAN if s.status == "armed" else CLR_ORANGE if s.status in ("detached", "unknown") else CLR_RED,
                             size=9.0,
                         ),
                         tag=s_tag, callback=cb, delegate=cb_delegate,
@@ -3860,6 +3865,10 @@ class AppDelegate(NSObject):
                         s_clr = CLR_ORANGE
                         s_icon = "questionmark.circle"
                         s_label = "? unknown"
+                    elif s.status == "armed":
+                        s_clr = CLR_CYAN
+                        s_icon = "clock.arrow.circlepath"
+                        s_label = "\u25c8 armed"
                     else:
                         s_clr = CLR_RED
                         s_icon = "xmark.circle"
@@ -3884,7 +3893,7 @@ class AppDelegate(NSObject):
                             tooltip=f"Focus window for '{s.name}'",
                         )
                         item.setEnabled_(True)
-                    elif s.status in ("detached", "unknown"):
+                    elif s.status in ("detached", "unknown", "armed"):
                         s_tag = _menu_devvm_tag
                         _menu_devvm_tag += 1
                         self._devvm_connect_map[s_tag] = (s.name, vm.vm_name)
@@ -3892,7 +3901,7 @@ class AppDelegate(NSObject):
                             s_text, indent=2,
                             image=sf_symbol(s_icon, color=s_clr, size=10.0),
                             action="devvmConnectClicked:", target=self, tag=s_tag,
-                            tooltip=f"Click to connect to '{s.name}'",
+                            tooltip=(f"Click to resume '{s.name}'" if s.status == "armed" else f"Click to connect to '{s.name}'"),
                         )
                         item.setEnabled_(True)
                     else:
