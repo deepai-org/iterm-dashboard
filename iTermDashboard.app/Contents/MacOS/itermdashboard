@@ -27,6 +27,7 @@ from AppKit import (
     NSVisualEffectView,
     NSWorkspace, NSAnimationContext, NSEvent,
     NSApplicationActivateIgnoringOtherApps,
+    NSOnState, NSOffState,
 )
 from Foundation import (
     NSDictionary, NSTimer, NSMakeRect, NSZeroRect,
