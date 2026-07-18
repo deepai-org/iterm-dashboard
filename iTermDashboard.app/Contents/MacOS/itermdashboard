@@ -30,7 +30,7 @@ from AppKit import (
 )
 from Foundation import (
     NSDictionary, NSTimer, NSMakeRect, NSZeroRect,
-    NSNotificationCenter, NSPointInRect,
+    NSNotificationCenter, NSPointInRect, NSUserDefaults,
 )
 
 
@@ -221,7 +221,10 @@ def _extract_et_session_name(full_cmd):
 
 def run_args(args, timeout=10):
     try:
-        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        # Force LC_NUMERIC=C so numeric output (e.g. ps %CPU) uses a decimal
+        # point regardless of the user's system locale (de_DE → "0,7" crash).
+        env = dict(os.environ, LC_NUMERIC="C")
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout, env=env)
         return r.stdout.strip()
     except Exception:
         return ""
@@ -2821,10 +2824,47 @@ SIDEBAR_HOVER_DELAY = 0.1     # seconds before expand
 SIDEBAR_EXIT_DELAY = 0.3      # seconds before collapse
 SIDEBAR_ANIM_DURATION = 0.15  # slide animation duration
 
+# ── Strip appearance defaults (persisted via NSUserDefaults) ──────────────────
+DEFAULTS_STRIP_HIDDEN = "stripAccentHidden"
+DEFAULTS_STRIP_OPACITY = "stripAccentOpacity"
+STRIP_OPACITY_OPTIONS = [0.0, 0.25, 0.5, 0.75, 1.0]   # 0% / 25% / 50% / 75% / 100%
+STRIP_OPACITY_DEFAULT = 0.8                              # original hardcoded value
+
 TERMINAL_BUNDLE_IDS = {
     "com.googlecode.iterm2",
     "com.nexus.terminal",
 }
+
+
+# ── Strip appearance helpers (NSUserDefaults-backed) ──────────────────────────
+
+def get_strip_hidden():
+    """Whether the accent strip should be invisible when sidebar is collapsed."""
+    return bool(NSUserDefaults.standardUserDefaults().boolForKey_(DEFAULTS_STRIP_HIDDEN))
+
+
+def set_strip_hidden(value):
+    NSUserDefaults.standardUserDefaults().setBool_forKey_(bool(value), DEFAULTS_STRIP_HIDDEN)
+
+
+def get_strip_opacity():
+    """Return opacity 0.0–1.0. Falls back to STRIP_OPACITY_DEFAULT when unset."""
+    defaults = NSUserDefaults.standardUserDefaults()
+    if defaults.objectForKey_(DEFAULTS_STRIP_OPACITY) is None:
+        return STRIP_OPACITY_DEFAULT
+    v = defaults.floatForKey_(DEFAULTS_STRIP_OPACITY)
+    return v if 0.0 <= v <= 1.0 else STRIP_OPACITY_DEFAULT
+
+
+def set_strip_opacity(value):
+    NSUserDefaults.standardUserDefaults().setFloat_forKey_(float(value), DEFAULTS_STRIP_OPACITY)
+
+
+def strip_bg_cgcolor():
+    """Compute the strip background CGColor given current persisted settings."""
+    if get_strip_hidden():
+        return NSColor.clearColor().CGColor()
+    return NSColor.controlAccentColor().colorWithAlphaComponent_(get_strip_opacity()).CGColor()
 
 
 
@@ -3502,10 +3542,12 @@ class AppDelegate(NSObject):
         # ── Accent strip (topmost — 2px accent, visible when collapsed) ──
         strip = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, SIDEBAR_STRIP_WIDTH, screen.size.height))
         strip.setWantsLayer_(True)
-        strip.layer().setBackgroundColor_(NSColor.controlAccentColor().colorWithAlphaComponent_(0.8).CGColor())
+        strip.layer().setBackgroundColor_(strip_bg_cgcolor())
         strip.setAutoresizingMask_(16)  # height flexible
         content.addSubview_(strip)
         self._sidebar_strip = strip
+        if get_strip_hidden():
+            strip.setHidden_(True)
 
         self._sidebar_window = win
         self._sidebar_scroll = scroll
@@ -3615,7 +3657,7 @@ class AppDelegate(NSObject):
 
         def completion_handler():
             if not self._sidebar_expanded:
-                strip.setHidden_(False)
+                strip.setHidden_(get_strip_hidden())  # respect user's hide-strip setting
                 effect_view.setHidden_(True)
 
         NSAnimationContext.beginGrouping()
@@ -3966,6 +4008,46 @@ class AppDelegate(NSObject):
 
         menu.addItem_(NSMenuItem.separatorItem())
 
+        # ── Sidebar settings ──
+        settings_header = rich_text([("SIDEBAR", BOLD, CLR_LABEL)])
+        settings_icon = sf_symbol("sidebar.left", color=CLR_ACCENT, size=12.0)
+        menu.addItem_(make_item(settings_header, image=settings_icon))
+
+        # Hide accent strip — checkbox toggle
+        _hidden = get_strip_hidden()
+        hide_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Hide accent strip", "stripHideClicked:", "")
+        hide_item.setTarget_(self)
+        hide_item.setState_(NSOnState if _hidden else NSOffState)
+        hide_item.setIndentationLevel_(1)
+        hide_item.setEnabled_(True)
+        hide_item.setToolTip_("Make the 2px accent strip invisible when the sidebar is collapsed")
+        menu.addItem_(hide_item)
+
+        # Strip opacity submenu (0 / 25 / 50 / 75 / 100 %)
+        _current_opacity = get_strip_opacity()
+        opacity_submenu = NSMenu.alloc().init()
+        opacity_submenu.setAutoenablesItems_(False)
+        for _opt in STRIP_OPACITY_OPTIONS:
+            _pct = int(round(_opt * 100))
+            _oi = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                f"{_pct}%", "stripOpacityClicked:", "")
+            _oi.setTarget_(self)
+            _oi.setTag_(_pct)
+            _oi.setState_(NSOnState if abs(_opt - _current_opacity) < 0.01 else NSOffState)
+            _oi.setEnabled_(True)
+            opacity_submenu.addItem_(_oi)
+        _cur_pct = int(round(_current_opacity * 100))
+        opacity_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Strip opacity", "", "")
+        opacity_item.setIndentationLevel_(1)
+        opacity_item.setToolTip_(f"Current: {_cur_pct}%")
+        opacity_item.setSubmenu_(opacity_submenu)
+        opacity_item.setEnabled_(True)
+        menu.addItem_(opacity_item)
+
+        menu.addItem_(NSMenuItem.separatorItem())
+
         # ── Summary ──
         summary_text = rich_text(data["summary_segments"])
         menu.addItem_(make_item(summary_text, indent=1))
@@ -4049,6 +4131,35 @@ class AppDelegate(NSObject):
 
     def quitClicked_(self, sender):
         NSApplication.sharedApplication().terminate_(None)
+
+    # ── Sidebar strip appearance callbacks ────────────────────────────────────
+
+    def stripHideClicked_(self, sender):
+        """Toggle the accent strip visibility. Updates the strip live."""
+        new_val = not get_strip_hidden()
+        set_strip_hidden(new_val)
+        strip = self._sidebar_strip
+        if strip:
+            strip.layer().setBackgroundColor_(strip_bg_cgcolor())
+            # When collapsed, the strip is the visible indicator — hide/show it.
+            # When expanded, the strip is already hidden by _expandSidebar.
+            if not self._sidebar_expanded:
+                strip.setHidden_(new_val)
+        sender.setState_(NSOnState if new_val else NSOffState)
+
+    def stripOpacityClicked_(self, sender):
+        """Set the accent strip opacity. Tag carries the percentage (0–100)."""
+        pct = sender.tag()
+        set_strip_opacity(pct / 100.0)
+        strip = self._sidebar_strip
+        if strip and not get_strip_hidden():
+            strip.layer().setBackgroundColor_(strip_bg_cgcolor())
+        # Update radio-button state across the opacity submenu
+        submenu = sender.menu()
+        if submenu:
+            for i in range(submenu.numberOfItems()):
+                item = submenu.itemAtIndex_(i)
+                item.setState_(NSOnState if item.tag() == pct else NSOffState)
 
     def menuWillOpen_(self, menu):
         self._start_refresh()
