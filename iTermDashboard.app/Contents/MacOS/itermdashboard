@@ -13,6 +13,9 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 
 import objc
+import warnings
+# Suppress harmless PyObjCPointer warnings (CGColor refs in setBackgroundColor_ calls).
+warnings.filterwarnings("ignore", category=objc.ObjCPointerWarning)
 from AppKit import (
     NSApplication, NSObject, NSMenu, NSMenuItem, NSImage,
     NSFont, NSAttributedString, NSMutableAttributedString,
