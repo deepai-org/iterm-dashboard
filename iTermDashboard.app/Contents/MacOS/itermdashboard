@@ -4149,6 +4149,11 @@ class AppDelegate(NSObject):
             # When expanded, the strip is already hidden by _expandSidebar.
             if not self._sidebar_expanded:
                 strip.setHidden_(new_val)
+            # setHidden_ on a layer-backed view inside a borderless panel does
+            # not trigger a redraw on its own — force the window to display.
+            win = self._sidebar_window
+            if win:
+                win.display()
         sender.setState_(NSOnState if new_val else NSOffState)
 
     def stripOpacityClicked_(self, sender):
