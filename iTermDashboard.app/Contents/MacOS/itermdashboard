@@ -579,7 +579,7 @@ PROD_KEYWORDS = {"prod", "production", "prd", "live", "primary"}
 
 ROLE_PATTERNS = {
     "editor": {"vim", "nvim", "vi", "nano", "emacs", "code", "hx", "helix", "micro"},
-    "agent": {"claude", "aider", "cursor", "copilot"},
+    "agent": {"claude", "aider", "cursor", "copilot", "opencode"},
     "build": {"make", "cargo", "go", "gcc", "g++", "clang", "cmake", "swift", "swiftc",
               "xcodebuild", "npm", "yarn", "pnpm", "bun", "webpack", "vite", "tsc", "rustc"},
     "test": {"pytest", "jest", "mocha", "cargo-test", "go-test", "rspec", "phpunit",
