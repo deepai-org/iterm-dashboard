@@ -5,9 +5,12 @@ import subprocess
 import json
 import re
 import os
+import sys
 import time
 import base64
 import threading
+import traceback
+from datetime import datetime
 from itertools import permutations, product
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -16,6 +19,35 @@ import objc
 import warnings
 # Suppress harmless PyObjCPointer warnings (CGColor refs in setBackgroundColor_ calls).
 warnings.filterwarnings("ignore", category=objc.ObjCPointerWarning)
+
+# ── Crash logging ─────────────────────────────────────────────────────────────
+# The status bar icon disappearing = the app crashed. Log every exception to a
+# file so we can diagnose without a visible terminal.
+_DEBUG_LOG = os.path.expanduser("~/itermdashboard-debug.log")
+
+
+def _log(msg):
+    try:
+        with open(_DEBUG_LOG, "a") as f:
+            f.write(f"[{datetime.now().isoformat()}] {msg}\n")
+    except Exception:
+        pass
+
+
+def _sys_excepthook(exc_type, exc_value, exc_tb):
+    msg = "".join(traceback.format_exception(exc_type, exc_value, exc_tb))
+    _log(f"UNHANDLED EXCEPTION (main thread):\n{msg}\n")
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+
+def _threading_excepthook(args):
+    msg = "".join(traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+    _log(f"UNHANDLED EXCEPTION (thread {args.thread.name}):\n{msg}\n")
+
+
+sys.excepthook = _sys_excepthook
+threading.excepthook = _threading_excepthook
+_log(f"=== itermdashboard starting (PID {os.getpid()}) ===")
 from AppKit import (
     NSApplication, NSObject, NSMenu, NSMenuItem, NSImage,
     NSFont, NSAttributedString, NSMutableAttributedString,
@@ -3716,20 +3748,29 @@ class AppDelegate(NSObject):
         thread.start()
 
     def _bg_refresh(self):
-        with self._lock:
-            prev = self._prev_snapshot
-        data, session_map, project_window_map, snapshot = collect_menu_data(prev_snapshot=prev)
-        with self._lock:
-            self._cached_data = data
-            self._session_map = session_map
-            self._project_window_map = project_window_map
-            if snapshot is not None:
-                self._prev_snapshot = snapshot
-        self.performSelectorOnMainThread_withObject_waitUntilDone_("_updateUI", None, False)
+        try:
+            with self._lock:
+                prev = self._prev_snapshot
+            data, session_map, project_window_map, snapshot = collect_menu_data(prev_snapshot=prev)
+            with self._lock:
+                self._cached_data = data
+                self._session_map = session_map
+                self._project_window_map = project_window_map
+                if snapshot is not None:
+                    self._prev_snapshot = snapshot
+            self.performSelectorOnMainThread_withObject_waitUntilDone_("_updateUI", None, False)
+            _log(f"refresh OK (status_item={'set' if self._status_item else 'NIL'})")
+        except Exception as e:
+            _log(f"refresh FAILED: {e}\n{traceback.format_exc()}")
+            raise
 
     def _updateUI(self):
-        self._updateMenu()
-        self._updateSidebar()
+        try:
+            self._updateMenu()
+            self._updateSidebar()
+        except Exception as e:
+            _log(f"_updateUI FAILED: {e}\n{traceback.format_exc()}")
+            raise
 
     def _updateMenu(self):
         with self._lock:
